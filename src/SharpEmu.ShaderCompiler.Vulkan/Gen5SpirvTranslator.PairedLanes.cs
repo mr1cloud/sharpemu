@@ -246,6 +246,20 @@ public static partial class Gen5SpirvTranslator
             return snapshot;
         }
 
+        private void UpdatePairedLanePredicate(uint register, uint value)
+        {
+            var predicate = register switch
+            {
+                106 => _lowerVcc,
+                107 => _upperVcc,
+                126 => _lowerExec,
+                127 => _upperExec,
+                _ => throw new ArgumentOutOfRangeException(nameof(register), register, "Expected a wave mask register."),
+            };
+            var laneBit = ShiftLeftLogical(UInt(1), PairedSubgroupLane());
+            Store(predicate, IsNotZero(BitwiseAnd(value, laneBit)));
+        }
+
         private void UpdateLaneMaskFlag(uint lowRegister)
         {
             if (!_pairedLanes || _inLanePass)
@@ -460,8 +474,11 @@ public static partial class Gen5SpirvTranslator
             public void BeforeInstruction(Gen5ShaderInstruction instruction) { }
             public void EndBlock() { }
 
-            public void InitializeMasks() =>
-                _context.StoreS64(106, _context._module.Constant64(_context._ulongType, 0));
+            public void InitializeMasks()
+            {
+                _context.StoreS(106, _context.UInt(0));
+                _context.StoreS(107, _context.UInt(0));
+            }
 
             public uint BooleanToWaveMask(uint condition)
             {

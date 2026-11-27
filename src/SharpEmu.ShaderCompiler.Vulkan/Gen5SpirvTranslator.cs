@@ -10309,6 +10309,10 @@ public static partial class Gen5SpirvTranslator
             {
                 UpdatePairedMeshPredicate(register, value);
             }
+            else if (_pairedLanes && register is 106 or 107 or 126 or 127)
+            {
+                UpdatePairedLanePredicate(register, value);
+            }
             else if (register is 106 or 107)
             {
                 if (_waveLaneCount != 32 || register == 106)
