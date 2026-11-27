@@ -256,6 +256,32 @@ public sealed class VulkanPresentEncodeFormatTests
         Assert.Equal(expectedKind, decoded.OutputKind);
     }
 
+    [Theory]
+    [InlineData(17u, 0u, 0u, Format.A1R5G5B5UnormPack16, 0xC6, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float)]
+    [InlineData(17u, 0u, 1u, Format.A1R5G5B5UnormPack16, 0xE4, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float)]
+    [InlineData(18u, 0u, 0u, Format.R5G5B5A1UnormPack16, 0x1B, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float)]
+    [InlineData(19u, 0u, 0u, Format.R4G4B4A4UnormPack16, 0x1B, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float)]
+    [InlineData(9u, 4u, 0u, Format.A2B10G10R10UintPack32, 0xE4, SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Uint)]
+    public void TryDecodeRenderTargetFormat_DecodesPackedSixteenBitAndRgb10UintTargets(
+        uint dataFormat,
+        uint numberType,
+        uint componentSwap,
+        Format expectedFormat,
+        byte expectedMapping,
+        SharpEmu.ShaderCompiler.Gen5PixelOutputKind expectedKind)
+    {
+        Assert.True(
+            VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+                dataFormat,
+                numberType,
+                componentSwap,
+                out var decoded));
+
+        Assert.Equal(expectedFormat, decoded.Format);
+        Assert.Equal(expectedMapping, decoded.ExportMapping.Packed);
+        Assert.Equal(expectedKind, decoded.OutputKind);
+    }
+
     [Fact]
     public void TryDecodeRenderTargetFormat_RejectsInvalidComponentSwap()
     {

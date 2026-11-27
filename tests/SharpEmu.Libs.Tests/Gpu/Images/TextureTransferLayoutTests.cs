@@ -132,9 +132,11 @@ public sealed class TextureTransferLayoutTests
     private static SharpEmu.ShaderCompiler.Gen5PixelOutputKind KindOf(Format host)
     {
         var name = host.ToString();
-        return name.EndsWith("Uint", StringComparison.Ordinal) ? SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Uint
-            : name.EndsWith("Sint", StringComparison.Ordinal) ? SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Sint
-            : SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float;
+        return name.EndsWith("Uint", StringComparison.Ordinal) || name.Contains("UintPack", StringComparison.Ordinal)
+            ? SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Uint
+            : name.EndsWith("Sint", StringComparison.Ordinal) || name.Contains("SintPack", StringComparison.Ordinal)
+                ? SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Sint
+                : SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float;
     }
 
     // The host image of a render target and the pixel output decoding of the presenter must agree
@@ -193,6 +195,37 @@ public sealed class TextureTransferLayoutTests
         }
 
         Assert.True(checkedCount > 30);
+    }
+
+    // Every render-target combination supported by TextureTransferLayout must also decode through
+    // the presenter with the same host format, export swizzle and numeric output kind.
+    [Fact]
+    public void RenderTargetTables_DecodeEverySupportedRenderTargetFormatAndOrder()
+    {
+        var checkedCount = 0;
+        foreach (var layout in Enum.GetValues<ChannelLayout>())
+        {
+            for (var type = 0u; type < 8; type++)
+            {
+                foreach (var order in Enum.GetValues<ChannelOrder>())
+                {
+                    if (!TextureTransferLayout.TryRenderTargetFormat(layout, (ChannelType)type, order, out var target))
+                    {
+                        continue;
+                    }
+
+                    Assert.True(
+                        SharpEmu.Libs.VideoOut.VulkanVideoPresenter.TryDecodeRenderTargetFormat((uint)layout, type, (uint)order, out var output),
+                        $"Missing presenter decode for layout={layout} type={type} order={order}");
+                    Assert.Equal(target.HostFormat, output.Format);
+                    Assert.Equal(target.ExportMapping.Packed, output.ExportMapping.Packed);
+                    Assert.Equal(KindOf(target.HostFormat), output.OutputKind);
+                    checkedCount++;
+                }
+            }
+        }
+
+        Assert.True(checkedCount > 150);
     }
 
     [Fact]

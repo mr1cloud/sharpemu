@@ -80,7 +80,7 @@ public sealed class TextureTransferLayout
         };
     }
 
-    public static RenderTargetFormatInfo RenderTargetFormat(ChannelLayout layout, ChannelType type, ChannelOrder order)
+    public static bool TryRenderTargetFormat(ChannelLayout layout, ChannelType type, ChannelOrder order, out RenderTargetFormatInfo info)
     {
         var encoding = GuestPixelFormats.ResolveRenderTargetEncoding(layout, type);
         if (encoding.IsValid && encoding.SupportsOrder(order))
@@ -90,8 +90,20 @@ public sealed class TextureTransferLayout
             if (host.Format != Format.Undefined && bytes != 0)
             {
                 var orderMapping = RenderTargetColorMappings[(int)order][encoding.Components - 1];
-                return new RenderTargetFormatInfo(host.Format, bytes, host.HostToStorage.Then(orderMapping));
+                info = new RenderTargetFormatInfo(host.Format, bytes, host.HostToStorage.Then(orderMapping));
+                return true;
             }
+        }
+
+        info = default;
+        return false;
+    }
+
+    public static RenderTargetFormatInfo RenderTargetFormat(ChannelLayout layout, ChannelType type, ChannelOrder order)
+    {
+        if (TryRenderTargetFormat(layout, type, order, out var info))
+        {
+            return info;
         }
 
         throw SubmissionScheduler.Fatal($"The render-target format combination is not supported: layout={(uint)layout} type={(uint)type} order={(uint)order}.");
