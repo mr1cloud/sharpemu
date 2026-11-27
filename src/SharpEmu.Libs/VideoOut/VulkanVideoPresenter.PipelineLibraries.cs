@@ -568,16 +568,39 @@ internal static unsafe partial class VulkanVideoPresenter
             compile.SetResult(created);
         }
 
-        // A part is compiled through the pipeline cache, not from and into pipeline binaries. The vertex input and color
-        // output parts hold no code: the driver gives them an all-zero pipeline key and no binaries, so on the binary path
-        // every one of them waited on the same build gate and looked for a binary that is never stored. The parts with code
-        // reach later pipelines through the cache, which the graphics prewarm fills before the session's draws ask for them.
+        // Parts with shader stages (pre-rasterization and fragment shader) go through pipeline binaries so their
+        // compiles persist across sessions and match StartGraphicsPrewarm's binary-skip progress. The vertex input
+        // and color output parts hold no shader code (StageCount == 0): the driver gives them an all-zero pipeline
+        // key and no binaries, so they stay on the in-memory pipeline cache.
         private Pipeline CompileGraphicsLibrary(GraphicsPipelineCreateInfo* create, GraphicsPipelineLibraryFlagsEXT part, string label)
         {
             var started = Stopwatch.GetTimestamp();
             var created = default(Pipeline);
-            var result = _vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, create, null, &created);
-            var milliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            Result result;
+            double milliseconds;
+            if (create->StageCount != 0)
+            {
+                result = CreatePipelineWithBinaries(
+                    create,
+                    &create->PNext,
+                    _pipelineCache,
+                    &CreateGraphicsPipelineCall,
+                    out created,
+                    out milliseconds,
+                    extraFlags: (PipelineCreateFlags2)create->Flags);
+                if (result != Result.Success && _pipelineBinaries is not null)
+                {
+                    var fallbackStarted = Stopwatch.GetTimestamp();
+                    result = _vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, create, null, &created);
+                    milliseconds = Stopwatch.GetElapsedTime(fallbackStarted).TotalMilliseconds;
+                }
+            }
+            else
+            {
+                result = _vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, create, null, &created);
+                milliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            }
+
             if (result == Result.Success)
             {
                 MarkPipelineCacheDirty();

@@ -258,9 +258,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var info = new PipelineCreateInfoKHR { SType = StructureType.PipelineCreateInfoKhr, PNext = createInfo };
             var key = new PipelineBinaryKeyKHR { SType = StructureType.PipelineBinaryKeyKhr };
-            return binaries.GetPipelineKey(_device, &info, &key) == Result.Success && key.KeySize != 0
-                ? new ReadOnlySpan<byte>(key.Key, (int)key.KeySize).ToArray()
-                : null;
+            if (binaries.GetPipelineKey(_device, &info, &key) != Result.Success || key.KeySize == 0)
+            {
+                return null;
+            }
+
+            // Drivers return an all-zero key for shaderless pipeline parts that carry no binary.
+            var bytes = new ReadOnlySpan<byte>(key.Key, (int)key.KeySize);
+            return bytes.IndexOfAnyExcept((byte)0) >= 0 ? bytes.ToArray() : null;
         }
 
         private string PipelineBinaryPath(byte[] key) => Path.Combine(_pipelineBinaryDirectory!, Convert.ToHexString(key) + ".bin");
