@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.Libs.Gpu;
+using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.ShaderCompiler;
 using Silk.NET.Vulkan;
 
@@ -77,6 +78,19 @@ internal static unsafe partial class VulkanVideoPresenter
         uint componentSwap,
         out VulkanRenderTargetFormat result)
     {
+        if (TextureTransferLayout.TryRenderTargetFormat(
+                (ChannelLayout)dataFormat,
+                (ChannelType)numberType,
+                (ChannelOrder)componentSwap,
+                out var targetFormat))
+        {
+            result = new VulkanRenderTargetFormat(
+                targetFormat.HostFormat,
+                PixelOutputKindOf(targetFormat.HostFormat),
+                new Gen5ColorComponentMapping(targetFormat.ExportMapping.Packed));
+            return true;
+        }
+
         var format = (dataFormat, numberType, componentSwap) switch
         {
             // Early geometry and scene targets use these color formats.
@@ -152,16 +166,7 @@ internal static unsafe partial class VulkanVideoPresenter
             return false;
         }
 
-        var outputKind = format switch
-        {
-            Format.R8Uint or Format.R16Uint or Format.R32Uint or Format.R8G8Uint or Format.R16G16Uint or
-                Format.R32G32Uint or Format.R8G8B8A8Uint or Format.R16G16B16A16Uint or
-                Format.R32G32B32A32Uint => Gen5PixelOutputKind.Uint,
-            Format.R8Sint or Format.R16Sint or Format.R32Sint or Format.R8G8Sint or Format.R16G16Sint or
-                Format.R32G32Sint or Format.R8G8B8A8Sint or Format.R16G16B16A16Sint or
-                Format.R32G32B32A32Sint => Gen5PixelOutputKind.Sint,
-            _ => Gen5PixelOutputKind.Float,
-        };
+        var outputKind = PixelOutputKindOf(format);
 
         var hostToStorage = dataFormat switch
         {
@@ -176,6 +181,17 @@ internal static unsafe partial class VulkanVideoPresenter
             hostToStorage.Then(orderMapping));
         return true;
     }
+
+    private static Gen5PixelOutputKind PixelOutputKindOf(Format format) => format switch
+    {
+        Format.R8Uint or Format.R16Uint or Format.R32Uint or Format.R8G8Uint or Format.R16G16Uint or
+            Format.R32G32Uint or Format.R8G8B8A8Uint or Format.R16G16B16A16Uint or
+            Format.R32G32B32A32Uint or Format.A2B10G10R10UintPack32 => Gen5PixelOutputKind.Uint,
+        Format.R8Sint or Format.R16Sint or Format.R32Sint or Format.R8G8Sint or Format.R16G16Sint or
+            Format.R32G32Sint or Format.R8G8B8A8Sint or Format.R16G16B16A16Sint or
+            Format.R32G32B32A32Sint or Format.A2B10G10R10SintPack32 => Gen5PixelOutputKind.Sint,
+        _ => Gen5PixelOutputKind.Float,
+    };
 
     private static bool TryGetRenderTargetComponentCount(
         uint dataFormat,
