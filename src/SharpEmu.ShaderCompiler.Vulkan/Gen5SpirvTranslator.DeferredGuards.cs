@@ -18,13 +18,20 @@ public static partial class Gen5SpirvTranslator
             Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_EXEC_GUARDS"), "0", StringComparison.Ordinal);
 
         private bool _deferGuards;
-        private readonly List<(uint Register, uint Old)> _deferredGuards = [];
-        private readonly HashSet<uint> _deferredGuardRegisters = [];
+        private readonly List<(uint Register, uint Old)>[] _deferredGuards = [[], []];
+        private readonly HashSet<uint>[] _deferredGuardRegisters = [[], []];
 
-        // A half wave keeps one guest lane per invocation, as a native wave does.
+        private int CurrentDeferredGuardHalf =>
+            _pairedLanes ? _laneHalf : _pairedMeshLanes ? _logicalHalf : 0;
+
+        private bool HasDeferredGuards =>
+            _deferredGuards[0].Count != 0 || _deferredGuards[1].Count != 0;
+
+        // Native waves, half waves, and paired waves (where each logical half tracks its own EXEC and VGPR bank)
+        // can coalesce per-write EXEC guards into one select per modified register when EXEC or the block ends.
         private bool CanDeferGuards =>
-            DeferredExecGuards && !_pairedLanes && !_pairedMeshLanes && !_hasIndirectControlFlow &&
-            _stage != Gen5SpirvStage.Mesh && _waveLowering is NativeWave32Lowering or NativeWave64Lowering or HalfWave64Lowering;
+            DeferredExecGuards && !_hasIndirectControlFlow &&
+            _waveLowering is NativeWave32Lowering or NativeWave64Lowering or HalfWave64Lowering or PairedWave64Lowering;
 
         // A guarded write inside the current region: the new value goes to every lane.
         private bool TryDeferGuard(uint register, uint value)
@@ -34,9 +41,10 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            if (_deferredGuardRegisters.Add(register))
+            var half = CurrentDeferredGuardHalf;
+            if (_deferredGuardRegisters[half].Add(register))
             {
-                _deferredGuards.Add((register, LoadV(register)));
+                _deferredGuards[half].Add((register, LoadV(register)));
             }
 
             Store(VectorPointer(register), value);
@@ -46,19 +54,102 @@ public static partial class Gen5SpirvTranslator
         // Ends the region: the lanes EXEC left out get back the values their registers had when it began.
         private void FlushDeferredGuards()
         {
-            if (_deferredGuards.Count == 0)
+            if (!HasDeferredGuards)
             {
                 return;
             }
 
-            var active = Load(_boolType, _exec);
-            foreach (var (register, old) in _deferredGuards)
+            FlushDeferredGuardsForHalf(0);
+            FlushDeferredGuardsForHalf(1);
+        }
+
+        private void FlushDeferredGuardsForHalf(int half)
+        {
+            var guards = _deferredGuards[half];
+            if (guards.Count == 0)
             {
-                Store(VectorPointer(register), _module.AddInstruction(SpirvOp.Select, _uintType, active, LoadV(register), old));
+                return;
             }
 
-            _deferredGuards.Clear();
-            _deferredGuardRegisters.Clear();
+            var previousHalf = CurrentDeferredGuardHalf;
+            var switched = previousHalf != half;
+            if (switched)
+            {
+                SelectDeferredGuardHalf(half);
+            }
+
+            try
+            {
+                var active = Load(_boolType, _exec);
+                foreach (var (register, old) in guards)
+                {
+                    Store(VectorPointer(register), _module.AddInstruction(SpirvOp.Select, _uintType, active, LoadV(register), old));
+                }
+
+                guards.Clear();
+                _deferredGuardRegisters[half].Clear();
+            }
+            finally
+            {
+                if (switched)
+                {
+                    SelectDeferredGuardHalf(previousHalf);
+                }
+            }
+        }
+
+        private void SelectDeferredGuardHalf(int half)
+        {
+            if (_pairedLanes)
+            {
+                SelectLaneHalf(half);
+            }
+            else if (_pairedMeshLanes)
+            {
+                SelectMeshHalf(half);
+            }
+        }
+
+        // Flushes whichever logical half owns an EXEC predicate variable before that predicate is overwritten.
+        private void FlushDeferredGuardsBeforeExecStore(uint pointer)
+        {
+            if (!HasDeferredGuards)
+            {
+                return;
+            }
+
+            if (_pairedLanes)
+            {
+                if (pointer == _lowerExec)
+                {
+                    FlushDeferredGuardsForHalf(0);
+                }
+                else if (pointer == _upperExec)
+                {
+                    FlushDeferredGuardsForHalf(1);
+                }
+
+                return;
+            }
+
+            if (_pairedMeshLanes)
+            {
+                if (pointer == _meshLaneRegisters[0].Execution)
+                {
+                    FlushDeferredGuardsForHalf(0);
+                }
+                else if (pointer == _meshLaneRegisters[1].Execution)
+                {
+                    FlushDeferredGuardsForHalf(1);
+                }
+
+                return;
+            }
+
+            if (pointer == _exec)
+            {
+                FlushDeferredGuardsForHalf(0);
+            }
         }
 
         // Instructions that can read the vector registers of other lanes (DPP, lane reads and writes, permutes,

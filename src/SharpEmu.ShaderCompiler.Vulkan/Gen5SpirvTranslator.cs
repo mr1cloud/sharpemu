@@ -4337,7 +4337,7 @@ public static partial class Gen5SpirvTranslator
         {
             error = string.Empty;
             // Addresses come from VGPRs, as on the physical storage buffer path: inactive lanes must hold their own values.
-            FlushDeferredGuards();
+            FlushDeferredGuardsForHalf(CurrentDeferredGuardHalf);
             var typed = control.Typed || instruction.Opcode.StartsWith("TBuffer", StringComparison.Ordinal);
             if (typed && (!control.Typed || !IsFormatBufferLoad(instruction.Opcode) ||
                 FormatD16Components(instruction.Opcode) != 0 ||
@@ -10161,11 +10161,8 @@ public static partial class Gen5SpirvTranslator
 
         private void Store(uint pointer, uint value)
         {
-            if (pointer == _exec && _deferredGuards.Count != 0)
-            {
-                // The region of the current EXEC ends.
-                FlushDeferredGuards();
-            }
+            // End the region of the EXEC predicate being overwritten before updating it.
+            FlushDeferredGuardsBeforeExecStore(pointer);
 
             if (_executingWave != 0 && pointer == _exec) value = LogicalAnd(value, _executingWave);
             if (_executingWave != 0 && (pointer == _scc || pointer == _programActive))

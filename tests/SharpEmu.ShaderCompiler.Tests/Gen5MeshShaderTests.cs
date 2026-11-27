@@ -1044,6 +1044,75 @@ public sealed class Gen5MeshShaderTests
         Assert.Contains("vgprUpperHalf", names);
     }
 
+    [Fact]
+    public void PairedMeshCoalescesDeferredExecGuardsPerHalfAndFlushesOnExecHiWrite()
+    {
+        int CountSelects(Gen5ShaderInstruction[] instructions)
+        {
+            var program = ResourceTestProgram.Program(instructions);
+            var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Mesh);
+            var request = new ShaderCompileRequest(plan, resources, layout)
+            {
+                WaveSize = 64,
+                LocalSizeX = 64,
+                Mesh = new MeshShaderConfiguration(64, 64, 0, 62, 64, 0, true, 32),
+            };
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+            ValidateWithInstalledSdk(shader.Spirv);
+
+            var words = new uint[shader.Spirv.Length / sizeof(uint)];
+            Buffer.BlockCopy(shader.Spirv, 0, words, 0, shader.Spirv.Length);
+            var selects = 0;
+            for (var offset = 5; offset < words.Length; offset += (int)(words[offset] >> 16))
+            {
+                if ((SpirvOp)(words[offset] & 0xFFFF) == SpirvOp.Select)
+                {
+                    selects++;
+                }
+            }
+
+            return selects;
+        }
+
+        // Single write to v2 under partial EXEC, followed by EXEC_HI update and another write to v2.
+        var baseline = CountSelects([
+            ResourceTestProgram.Sop1(0, "SMovB32", 126, Gen5Operand.Scalar(0)),
+            ResourceTestProgram.Sop1(4, "SMovB32", 127, Gen5Operand.Scalar(1)),
+            ResourceTestProgram.Vop2(8, "VAddU32", 2, Gen5Operand.Vector(0), Gen5Operand.Vector(1)),
+            ResourceTestProgram.Sop1(12, "SMovB32", 127, Gen5Operand.Scalar(2)),
+            ResourceTestProgram.Vop2(16, "VAddU32", 2, Gen5Operand.Vector(2), Gen5Operand.Vector(0)),
+            ResourceTestProgram.EndProgram(20),
+        ]);
+
+        // Five consecutive writes to v2 under the same partial EXEC must coalesce into the same
+        // number of OpSelect instructions as a single write.
+        var coalesced = CountSelects([
+            ResourceTestProgram.Sop1(0, "SMovB32", 126, Gen5Operand.Scalar(0)),
+            ResourceTestProgram.Sop1(4, "SMovB32", 127, Gen5Operand.Scalar(1)),
+            ResourceTestProgram.Vop2(8, "VAddU32", 2, Gen5Operand.Vector(0), Gen5Operand.Vector(1)),
+            ResourceTestProgram.Vop2(12, "VAddU32", 2, Gen5Operand.Vector(2), Gen5Operand.Vector(1)),
+            ResourceTestProgram.Vop2(16, "VAddU32", 2, Gen5Operand.Vector(2), Gen5Operand.Vector(0)),
+            ResourceTestProgram.Vop2(20, "VAddU32", 2, Gen5Operand.Vector(2), Gen5Operand.Vector(1)),
+            ResourceTestProgram.Vop2(24, "VAddU32", 2, Gen5Operand.Vector(2), Gen5Operand.Vector(0)),
+            ResourceTestProgram.Sop1(28, "SMovB32", 127, Gen5Operand.Scalar(2)),
+            ResourceTestProgram.Vop2(32, "VAddU32", 2, Gen5Operand.Vector(2), Gen5Operand.Vector(0)),
+            ResourceTestProgram.EndProgram(36),
+        ]);
+
+        // Without the mid-block EXEC_HI write, half 1 only flushes once at block end instead of twice.
+        var withoutExecHiChange = CountSelects([
+            ResourceTestProgram.Sop1(0, "SMovB32", 126, Gen5Operand.Scalar(0)),
+            ResourceTestProgram.Sop1(4, "SMovB32", 127, Gen5Operand.Scalar(1)),
+            ResourceTestProgram.Vop2(8, "VAddU32", 2, Gen5Operand.Vector(0), Gen5Operand.Vector(1)),
+            ResourceTestProgram.Vop2(12, "VAddU32", 2, Gen5Operand.Vector(2), Gen5Operand.Vector(1)),
+            ResourceTestProgram.Vop2(16, "VAddU32", 2, Gen5Operand.Vector(2), Gen5Operand.Vector(0)),
+            ResourceTestProgram.EndProgram(20),
+        ]);
+
+        Assert.Equal(baseline, coalesced);
+        Assert.Equal(withoutExecHiChange + 1, coalesced);
+    }
+
     private sealed class FixtureMemory : ICpuMemory
     {
         private readonly List<(ulong Address, byte[] Data)> _regions = [];
