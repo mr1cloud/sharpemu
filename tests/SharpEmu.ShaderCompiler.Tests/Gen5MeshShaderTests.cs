@@ -950,6 +950,100 @@ public sealed class Gen5MeshShaderTests
         }
     }
 
+    [Fact]
+    public void PairedMeshWithoutMovrelUsesScalarVectorRegistersInsteadOfArrays()
+    {
+        var program = ResourceTestProgram.Program(
+            ResourceTestProgram.Vop2(0, "VAddU32", 3, Gen5Operand.Vector(0), Gen5Operand.Vector(1)),
+            ResourceTestProgram.Vop2(8, "VAddU32", 4, Gen5Operand.Vector(3), Gen5Operand.Scalar(0)),
+            ResourceTestProgram.EndProgram(16));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Mesh);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            WaveSize = 64,
+            LocalSizeX = 64,
+            Mesh = new MeshShaderConfiguration(64, 64, 0, 62, 64, 0, true, 32),
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        ValidateWithInstalledSdk(shader.Spirv);
+
+        var words = new uint[shader.Spirv.Length / sizeof(uint)];
+        Buffer.BlockCopy(shader.Spirv, 0, words, 0, shader.Spirv.Length);
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var constants = new Dictionary<uint, uint>();
+        var has256Array = false;
+        for (var offset = 5; offset < words.Length; offset += (int)(words[offset] >> 16))
+        {
+            var opcode = (SpirvOp)(words[offset] & 0xFFFF);
+            if (opcode == SpirvOp.Name)
+            {
+                names.Add(System.Text.Encoding.UTF8.GetString(shader.Spirv,
+                    (offset + 2) * 4, ((int)(words[offset] >> 16) - 2) * 4).TrimEnd('\0'));
+            }
+            else if (opcode == SpirvOp.Constant && words[offset] >> 16 == 4)
+            {
+                constants[words[offset + 2]] = words[offset + 3];
+            }
+            else if (opcode == SpirvOp.TypeArray && constants.TryGetValue(words[offset + 3], out var len) && len == 256)
+            {
+                has256Array = true;
+            }
+        }
+
+        Assert.False(has256Array);
+        Assert.DoesNotContain("vgpr", names);
+        Assert.DoesNotContain("vgprUpperHalf", names);
+        Assert.Contains("v0", names);
+        Assert.Contains("vu0", names);
+        Assert.Contains("v4", names);
+        Assert.Contains("vu4", names);
+    }
+
+    [Fact]
+    public void PairedMeshWithLargeMovrelFanOutUsesPairedPrivateVectorArrays()
+    {
+        var instructions = new List<Gen5ShaderInstruction>
+        {
+            ResourceTestProgram.Vop1(0, "VMovB32", 60, Gen5Operand.Vector(0)),
+            ResourceTestProgram.Sop1(8, "SMovB32", 124, Gen5Operand.Scalar(0)),
+        };
+        uint pc = 16;
+        for (var index = 0; index < 40; index++)
+        {
+            instructions.Add(ResourceTestProgram.Vop1(pc, "VMovrelsB32", 1, Gen5Operand.Vector(0)));
+            pc += 4;
+            instructions.Add(ResourceTestProgram.Vop1(pc, "VMovreldB32", 0, Gen5Operand.Vector(1)));
+            pc += 4;
+        }
+        instructions.Add(ResourceTestProgram.EndProgram(pc));
+
+        var program = ResourceTestProgram.Program(instructions.ToArray());
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Mesh);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            WaveSize = 64,
+            LocalSizeX = 64,
+            Mesh = new MeshShaderConfiguration(64, 64, 0, 62, 64, 0, true, 32),
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        ValidateWithInstalledSdk(shader.Spirv);
+
+        var words = new uint[shader.Spirv.Length / sizeof(uint)];
+        Buffer.BlockCopy(shader.Spirv, 0, words, 0, shader.Spirv.Length);
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        for (var offset = 5; offset < words.Length; offset += (int)(words[offset] >> 16))
+        {
+            if ((SpirvOp)(words[offset] & 0xFFFF) == SpirvOp.Name)
+            {
+                names.Add(System.Text.Encoding.UTF8.GetString(shader.Spirv,
+                    (offset + 2) * 4, ((int)(words[offset] >> 16) - 2) * 4).TrimEnd('\0'));
+            }
+        }
+
+        Assert.Contains("vgpr", names);
+        Assert.Contains("vgprUpperHalf", names);
+    }
+
     private sealed class FixtureMemory : ICpuMemory
     {
         private readonly List<(ulong Address, byte[] Data)> _regions = [];

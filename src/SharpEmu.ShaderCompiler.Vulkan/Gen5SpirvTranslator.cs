@@ -665,7 +665,7 @@ public static partial class Gen5SpirvTranslator
                 // sized Private array when unbounded V_MOVREL* select chains would explode SPIR-V
                 // size and driver compile time.
                 _dynamicVectorRange = DynamicVectorRange(_request.Program);
-                if (_stage != Gen5SpirvStage.Mesh && ShouldUseDynamicVectorArray())
+                if (ShouldUseDynamicVectorArray())
                 {
                     _vectorRegisterArrayLength = Math.Min(_dynamicVectorRange.Last + 16, VectorRegisterCount);
                     var arrayType = _module.TypeArray(_uintType, _vectorRegisterArrayLength);
@@ -9738,7 +9738,7 @@ public static partial class Gen5SpirvTranslator
         private bool ShouldUseDynamicVectorArray()
         {
             var rangeSize = (ulong)(_dynamicVectorRange.Last - _dynamicVectorRange.First + 1);
-            var laneMultiplier = _pairedLanes ? 2ul : 1ul;
+            var laneMultiplier = _pairedLanes || _pairedMeshLanes ? 2ul : 1ul;
             ulong estimatedSelects = 0;
             foreach (var instruction in _request.Program.Instructions)
             {
