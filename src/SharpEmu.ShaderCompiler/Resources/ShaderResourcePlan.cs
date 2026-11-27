@@ -248,7 +248,8 @@ public sealed partial class ShaderResourcePlan
         int dynamicUserData = -1, BufferDescriptorNormalizer? normalizeBufferDescriptor = null,
         ImageDescriptorNormalizer? normalizeImageDescriptor = null, Func<long>? imageNormalizationVersion = null,
         StableImageDescriptorLimits stableImageLimits = default, bool? scalarDataOnDevice = null,
-        bool? deviceRecordCounts = null, bool? runtimeImageSwizzles = null, bool preferHeapRecords = false)
+        bool? deviceRecordCounts = null, bool? runtimeImageSwizzles = null, bool preferHeapRecords = false,
+        bool pairedWave64 = false)
     {
         // Mesh system inputs are not uniform user data, even when a GS pointer occupies s0:s1.
         var graph = ScalarGraphDiskCache.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize,
@@ -314,7 +315,8 @@ public sealed partial class ShaderResourcePlan
         // A program with shader calls, or a compute program with many device-address dwords (CompactMemoryAccessPolicy),
         // reads device addresses without branches; an access it does not make reads the host's fallback address.
         if (plan.Info.UsesDeviceAddresses &&
-            (Gen5ShaderCallLinker.IsLinked(program) || CompactMemoryAccessPolicy.Prefers(plan, stage)))
+            (Gen5ShaderCallLinker.IsLinked(program) ||
+             CompactMemoryAccessPolicy.Prefers(plan, stage, CompactMemoryAccessPolicy.Threshold, pairedWave64)))
             plan.Info.UsesDeviceAddressFallback = true;
         if (callMarks && program.Instructions.Any(static instruction => instruction.Control is ShaderCallFaultControl { ReturnPc: not null }))
             plan.Info.UsesCallMarks = true;
