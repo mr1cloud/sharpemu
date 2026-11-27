@@ -353,22 +353,22 @@ public static partial class Gen5SpirvTranslator
                         _faultBuffer = DeclareWordBlock("faultBuffer", number);
                         break;
                     case DescriptorBindingKind.FlattenedResourceTable:
-                        _flattenedTable = DeclareWordBlock("flattenedResourceTable", number);
+                        _flattenedTable = DeclareWordBlock("flattenedResourceTable", number, readOnly: true);
                         break;
                     case DescriptorBindingKind.ShaderData:
-                        _shaderData = DeclareWordBlock("shaderData", number);
+                        _shaderData = DeclareWordBlock("shaderData", number, readOnly: true);
                         break;
                     case DescriptorBindingKind.MipStatistics:
                         _mipStatistics = DeclareWordBlock("mipStatistics", number);
                         break;
                     case DescriptorBindingKind.CallRecords:
-                        _callRecords = DeclareWordBlock("callRecords", number);
+                        _callRecords = DeclareWordBlock("callRecords", number, readOnly: true);
                         break;
                     case DescriptorBindingKind.CallMarks:
                         _callMarks = DeclareWordBlock("callMarks", number);
                         break;
                     case DescriptorBindingKind.DeviceAddressFallback:
-                        _deviceAddressFallback = DeclareWordBlock("deviceAddressFallback", number);
+                        _deviceAddressFallback = DeclareWordBlock("deviceAddressFallback", number, readOnly: true);
                         break;
                     default:
                         DeclareImageClass(binding, number);
@@ -586,12 +586,22 @@ public static partial class Gen5SpirvTranslator
         }
 
         // One storage block holding a runtime array of dwords.
-        private uint DeclareWordBlock(string name, uint bindingNumber)
+        private uint DeclareWordBlock(string name, uint bindingNumber, bool readOnly = false)
         {
             var block = _module.TypeStruct(WordRuntimeArray());
             _module.AddDecoration(block, SpirvDecoration.Block);
             _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
+            if (readOnly)
+            {
+                _module.AddMemberDecoration(block, 0, SpirvDecoration.NonWritable);
+            }
+
             var variable = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.StorageBuffer, block), SpirvStorageClass.StorageBuffer);
+            if (readOnly)
+            {
+                _module.MarkImmutableVariable(variable);
+            }
+
             _module.AddName(variable, name);
             _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, 0);
             _module.AddDecoration(variable, SpirvDecoration.Binding, bindingNumber);
@@ -606,6 +616,7 @@ public static partial class Gen5SpirvTranslator
             _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
             _module.AddMemberDecoration(block, 0, SpirvDecoration.NonWritable);
             var variable = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.StorageBuffer, block), SpirvStorageClass.StorageBuffer);
+            _module.MarkImmutableVariable(variable);
             _module.AddName(variable, "deviceAddressPageTable");
             _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, 0);
             _module.AddDecoration(variable, SpirvDecoration.Binding, bindingNumber);
@@ -873,6 +884,7 @@ public static partial class Gen5SpirvTranslator
 
         private uint _shaderDataLength;
         private uint _flattenedTableLength;
+        private uint _storageBlockLengthsFunction;
 
         private void InitializeStorageBlockLengths()
         {
@@ -881,6 +893,7 @@ public static partial class Gen5SpirvTranslator
                 _shaderDataLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _shaderData, 0);
             if (_flattenedTable != 0)
                 _flattenedTableLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _flattenedTable, 0);
+            _storageBlockLengthsFunction = _module.CurrentFunction;
         }
 
         // A compact program's fallback address (ResolveCompactDeviceAddress): a readable address the host binds
@@ -904,8 +917,12 @@ public static partial class Gen5SpirvTranslator
 
         private uint StorageBlockLength(uint block)
         {
-            if (block == _shaderData && _shaderDataLength != 0) return _shaderDataLength;
-            if (block == _flattenedTable && _flattenedTableLength != 0) return _flattenedTableLength;
+            if (_storageBlockLengthsFunction != 0 && _module.CurrentFunction == _storageBlockLengthsFunction)
+            {
+                if (block == _shaderData && _shaderDataLength != 0) return _shaderDataLength;
+                if (block == _flattenedTable && _flattenedTableLength != 0) return _flattenedTableLength;
+            }
+
             return _module.AddInstruction(SpirvOp.ArrayLength, _uintType, block, 0);
         }
 
@@ -939,9 +956,13 @@ public static partial class Gen5SpirvTranslator
                 return LoadFlattenedWord(UInt(slot));
             }
 
-            return _request.Bindings.UsesTableBlock
-                ? LoadTableWord(UInt(_request.Bindings.TableFlattenedDword + slot))
-                : Load(_uintType, BlockWordPointer(_flattenedTable, UInt(slot)));
+            if (_request.Bindings.UsesTableBlock)
+            {
+                return LoadTableWord(UInt(_request.Bindings.TableFlattenedDword + slot));
+            }
+
+            var hoisted = _module.EntryWordLoad(_uintType, _storageUintPointer, _flattenedTable, UInt(0), UInt(slot));
+            return hoisted != 0 ? hoisted : Load(_uintType, BlockWordPointer(_flattenedTable, UInt(slot)));
         }
 
         private uint LoadReservedFlattenedWord(uint index) =>
@@ -1215,24 +1236,13 @@ public static partial class Gen5SpirvTranslator
 
         private void StoreDeviceMaskedWord(uint address64, uint value, uint mask, uint allowed)
         {
-            var touched = LogicalAnd(allowed, _module.AddInstruction(SpirvOp.INotEqual, _boolType, mask, UInt(0)));
-            EmitConditional(touched, () =>
+            if (!_request.TraceDeviceAddressFaults)
             {
-                var (pointer, valid) = ResolveDeviceAddress(address64);
-                EmitConditional(valid, () =>
-                {
-                    var wordPointer = DeviceWordPointer(pointer);
-                    var full = _module.AddInstruction(SpirvOp.IEqual, _boolType, mask, UInt(uint.MaxValue));
-                    EmitConditional(
-                        full,
-                        () => _module.AddStatement(SpirvOp.Store, wordPointer, value, 2u, 4u),
-                        () => EmitAtomicWordUpdate(
-                            wordPointer,
-                            observed => BitwiseOr(
-                                BitwiseAnd(observed, _module.AddInstruction(SpirvOp.Not, _uintType, mask)),
-                                value)));
-                });
-            });
+                CallDeviceMaskedStore(address64, value, mask, allowed);
+                return;
+            }
+
+            EmitStoreDeviceMaskedWordBody(address64, value, mask, allowed);
         }
 
         // An unaligned dword assembled from the two aligned dwords it spans.
@@ -2517,7 +2527,9 @@ public static partial class Gen5SpirvTranslator
             (uint Resource, uint Element)? fixedElement = null,
             bool heapVolumeLayers = false,
             ImageNumericClass heapNumericClass = ImageNumericClass.Float,
-            uint runtimeElement = 0)
+            uint runtimeElement = 0,
+            uint heapRecordIndex = 0,
+            uint heapElementClass = 0)
         {
             error = string.Empty;
             resource = default;
@@ -2595,7 +2607,8 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 (elementPointer, imageValue) = LoadHeapElement(heapImageSlot, imageClass.ImageType,
-                    HeapImageIndex(heapImage, heapImageSlot, heapNumericClass), numericClass: heapNumericClass);
+                    HeapImageIndex(heapImage, heapImageSlot, heapNumericClass, heapRecordIndex, heapElementClass),
+                    numericClass: heapNumericClass);
             }
             else if (fixedElement is null && heapImageSlot >= 0 &&
                 request.CallRecordImageByMemoryIndex.TryGetValue(memoryIndex, out var recordImage))
@@ -2734,15 +2747,17 @@ public static partial class Gen5SpirvTranslator
         // The element an image read takes through the declaration of one numeric class: the record's element when it
         // holds a texture of that class and the null element otherwise, so no declaration reads a view of another class.
         // A class without integer forms holds float views only.
-        private uint HeapImageIndex(HeapRecordUse use, int slot, ImageNumericClass numericClass = ImageNumericClass.Float)
+        private uint HeapImageIndex(HeapRecordUse use, int slot, ImageNumericClass numericClass = ImageNumericClass.Float,
+            uint recordIndex = 0, uint elementClass = 0)
         {
-            var index = HeapRecordIndex(use);
+            var index = recordIndex != 0 ? recordIndex : HeapRecordIndex(use);
             if (!BindlessHeap.HoldsIntegers(slot))
             {
                 return index;
             }
 
-            var ofClass = _module.AddInstruction(SpirvOp.IEqual, _boolType, HeapElementClass(index), UInt(BindlessHeap.ClassCode(numericClass)));
+            var resolvedClass = elementClass != 0 ? elementClass : HeapElementClass(index);
+            var ofClass = _module.AddInstruction(SpirvOp.IEqual, _boolType, resolvedClass, UInt(BindlessHeap.ClassCode(numericClass)));
             return _module.AddInstruction(SpirvOp.Select, _uintType, ofClass, index, UInt(BindlessHeap.CallRecordNullIndex));
         }
 
@@ -2971,7 +2986,7 @@ public static partial class Gen5SpirvTranslator
         // A record marked again under the same EXEC value with no branch since finds its bit set, so that mark is left out.
         private void MarkHeapRecord(int slot, uint index)
         {
-            var feedback = HeapFeedback();
+            _ = HeapFeedback();
             if (_module.CurrentBlock != _markedHeapRecordsBlock)
             {
                 _markedHeapRecords.Clear();
@@ -2984,16 +2999,8 @@ public static partial class Gen5SpirvTranslator
                 return;
             }
 
-            var word = IAdd(UInt((uint)slot * BindlessHeap.FeedbackWordsPerArray), ShiftRightLogical(index, UInt(5)));
-            var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(index, UInt(31)));
-            var pointer = BlockWordPointer(feedback, word);
-            var unmarked = _module.AddInstruction(SpirvOp.IEqual, _boolType, BitwiseAnd(Load(_uintType, pointer), bit), UInt(0));
-            if (exec != 0)
-            {
-                unmarked = LogicalAnd(unmarked, exec);
-            }
-
-            EmitConditional(unmarked, () => _module.AddInstruction(SpirvOp.AtomicOr, _uintType, pointer, UInt(1), UInt(0), bit));
+            var active = exec != 0 ? exec : _module.ConstantBool(true);
+            CallMarkHeapRecord(UInt((uint)slot * BindlessHeap.FeedbackWordsPerArray), index, active);
             _markedHeapRecordsBlock = _module.CurrentBlock;
         }
 

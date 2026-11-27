@@ -510,6 +510,7 @@ public static partial class Gen5SpirvTranslator
                 EmitCallRecordSearch();
                 EmitDeviceRangeFunctions();
                 EmitDeviceDwordFunction();
+                EmitOutlinedHelpers();
 
                 var model = _stage switch
                 {
@@ -3719,6 +3720,7 @@ public static partial class Gen5SpirvTranslator
                 UInt((semantics & ~0xCu) | 0x2u));
             _module.AddStatement(SpirvOp.Branch, header);
 
+            _module.DeclareLoopHeader(header);
             _module.AddLabel(header);
             var observed = _module.AddInstruction(
                 SpirvOp.Phi,
@@ -3771,6 +3773,7 @@ public static partial class Gen5SpirvTranslator
                 UInt((semantics & ~0xCu) | 0x2u));
             _module.AddStatement(SpirvOp.Branch, header);
 
+            _module.DeclareLoopHeader(header);
             _module.AddLabel(header);
             var observed = _module.AddInstruction(
                 SpirvOp.Phi,
@@ -6507,27 +6510,8 @@ public static partial class Gen5SpirvTranslator
 
         // Writes the masked bits of one dword: a plain store for a full mask, else an
         // atomic read-modify-write that keeps the other bits.
-        private void StoreBufferMaskedWord(int bindingIndex, uint dwordAddress, uint value, uint mask)
-        {
-            var touched = _module.AddInstruction(
-                SpirvOp.LogicalAnd,
-                _boolType,
-                _module.AddInstruction(SpirvOp.INotEqual, _boolType, mask, UInt(0)),
-                IsBufferWordInRange(bindingIndex, dwordAddress));
-            EmitConditional(touched, () =>
-            {
-                var pointer = BufferWordPointer(bindingIndex, dwordAddress);
-                var full = _module.AddInstruction(SpirvOp.IEqual, _boolType, mask, UInt(uint.MaxValue));
-                EmitConditional(
-                    full,
-                    () => Store(pointer, value),
-                    () => EmitAtomicWordUpdate(
-                        pointer,
-                        observed => BitwiseOr(
-                            BitwiseAnd(observed, _module.AddInstruction(SpirvOp.Not, _uintType, mask)),
-                            value)));
-            });
-        }
+        private void StoreBufferMaskedWord(int bindingIndex, uint dwordAddress, uint value, uint mask) =>
+            CallBufferMaskedStore(bindingIndex, dwordAddress, value, mask);
 
         // Compare-exchange loop: the merge runs on the observed word until the
         // exchange succeeds. Returns the observed (pre-exchange) word at the
@@ -6544,6 +6528,7 @@ public static partial class Gen5SpirvTranslator
             _module.AddLabel(preheader);
             var initial = _module.AddInstruction(SpirvOp.AtomicLoad, _uintType, pointer, UInt(scope), UInt(0));
             _module.AddStatement(SpirvOp.Branch, header);
+            _module.DeclareLoopHeader(header);
             _module.AddLabel(header);
             var observed = _module.AddInstruction(
                 SpirvOp.Phi,
@@ -6771,7 +6756,8 @@ public static partial class Gen5SpirvTranslator
 
         private bool TryEmitHeapLoad(Gen5ShaderInstruction instruction, Gen5ImageControl image, HeapRecordUse heapImage, out string error)
         {
-            var elementClass = HeapElementClass(HeapRecordIndex(heapImage));
+            var recordIndex = HeapRecordIndex(heapImage);
+            var elementClass = HeapElementClass(recordIndex);
             var emitted = true;
             var branchError = string.Empty;
             foreach (var numericClass in new[] { ImageNumericClass.Float, ImageNumericClass.Uint, ImageNumericClass.Sint })
@@ -6790,7 +6776,7 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     emitted = TryResolveLayoutImage(instruction, image, out var resource, out var imageObject, out var dstSelect, out branchError,
-                            heapNumericClass: numericClass) &&
+                            heapNumericClass: numericClass, heapRecordIndex: recordIndex, heapElementClass: elementClass) &&
                         EmitImageOperation(instruction, image, resource, imageObject, dstSelect,
                             HeapReadMipLevel(instruction, image, resource), out branchError);
                 });
