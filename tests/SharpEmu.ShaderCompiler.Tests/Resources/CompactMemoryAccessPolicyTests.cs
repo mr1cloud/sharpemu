@@ -58,6 +58,41 @@ public sealed class CompactMemoryAccessPolicyTests
         Assert.False(CompactMemoryAccessPolicy.Prefers(plan, ShaderStage.Compute, 1));
     }
 
+    [Fact]
+    public void FormattedDeviceDescriptorAccessesCarryHigherWeightThanPlainDwords()
+    {
+        var plan = Extract(CopyProgram(1), userDataCount: 0);
+        plan.Memory.Entries[0].DeviceDescriptor = true;
+        var plainWeight = CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan);
+        Assert.Equal(1, plainWeight);
+
+        var formattedReadPlan = Extract(Program(
+            MoveVector(0x00, 0, 0),
+            BufferLoad(0x08, 20, dwords: 4, formatted: true),
+            EndProgram(0x10)));
+        Assert.Equal(0, CompactMemoryAccessPolicy.CountDeviceAddressDwords(formattedReadPlan));
+        Assert.NotEmpty(formattedReadPlan.Memory.Entries);
+        foreach (var entry in formattedReadPlan.Memory.Entries)
+        {
+            entry.DeviceDescriptor = true;
+        }
+
+        Assert.Equal(16, CompactMemoryAccessPolicy.CountDeviceAddressDwords(formattedReadPlan));
+
+        var formattedWritePlan = Extract(Program(
+            MoveVector(0x00, 0, 0),
+            BufferStore(0x08, 20, dwords: 4, formatted: true),
+            EndProgram(0x10)));
+        Assert.Equal(0, CompactMemoryAccessPolicy.CountDeviceAddressDwords(formattedWritePlan));
+        Assert.NotEmpty(formattedWritePlan.Memory.Entries);
+        foreach (var entry in formattedWritePlan.Memory.Entries)
+        {
+            entry.DeviceDescriptor = true;
+        }
+
+        Assert.Equal(32, CompactMemoryAccessPolicy.CountDeviceAddressDwords(formattedWritePlan));
+    }
+
     // A program that reads few dwords through device addresses keeps the default lowering, whatever its number of
     // bound-buffer accesses: compact access would not remove its branches, and a changed module misses the driver's
     // pipeline cache once.
