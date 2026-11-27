@@ -326,6 +326,373 @@ public sealed class SpirvOptimizationTests
         Assert.DoesNotContain(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && words[1] == ptr1 && words[2] == c7);
     }
 
+    [Fact]
+    public void LoopHeaderPrivateVariablesArePromotedToSsaPhis()
+    {
+        var previous = SpirvModuleBuilder.KeepsUnreadVariables;
+        SpirvModuleBuilder.KeepsUnreadVariables = false;
+        try
+        {
+            var module = new SpirvModuleBuilder();
+            module.AddCapability(SpirvCapability.Shader);
+            var u32 = module.TypeInt(32, false);
+            var boolean = module.TypeBool();
+            var acc = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, u32), SpirvStorageClass.Private);
+            var counter = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, u32), SpirvStorageClass.Private);
+            var input = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Input, u32), SpirvStorageClass.Input);
+            var output = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Output, u32), SpirvStorageClass.Output);
+            module.AddDecoration(input, SpirvDecoration.Location, 0);
+            module.AddDecoration(input, SpirvDecoration.Flat);
+            module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+            var function = module.BeginFunction(module.TypeVoid(), module.TypeFunction(module.TypeVoid()));
+            module.AddEntryPoint(SpirvExecutionModel.Vertex, function, "main", [acc, counter, input, output]);
+            module.AddLabel();
+
+            var zero = module.Constant(u32, 0);
+            var one = module.Constant(u32, 1);
+            var limit = module.AddInstruction(SpirvOp.Load, u32, input);
+            var header = module.AllocateId();
+            var body = module.AllocateId();
+            var latch = module.AllocateId();
+            var done = module.AllocateId();
+            module.DeclareLoopHeader(header);
+
+            module.AddStatement(SpirvOp.Store, acc, zero);
+            module.AddStatement(SpirvOp.Store, counter, zero);
+            module.AddStatement(SpirvOp.Branch, header);
+
+            module.AddLabel(header);
+            var curCounter = module.AddInstruction(SpirvOp.Load, u32, counter);
+            var cond = module.AddInstruction(SpirvOp.ULessThan, boolean, curCounter, limit);
+            module.AddStatement(SpirvOp.LoopMerge, done, latch, 0);
+            module.AddStatement(SpirvOp.BranchConditional, cond, body, done);
+
+            module.AddLabel(body);
+            var curAcc = module.AddInstruction(SpirvOp.Load, u32, acc);
+            var nextAcc = module.AddInstruction(SpirvOp.IAdd, u32, curAcc, curCounter);
+            module.AddStatement(SpirvOp.Store, acc, nextAcc);
+            module.AddStatement(SpirvOp.Branch, latch);
+
+            module.AddLabel(latch);
+            var latchCounter = module.AddInstruction(SpirvOp.Load, u32, counter);
+            var nextCounter = module.AddInstruction(SpirvOp.IAdd, u32, latchCounter, one);
+            module.AddStatement(SpirvOp.Store, counter, nextCounter);
+            module.AddStatement(SpirvOp.Branch, header);
+
+            module.AddLabel(done);
+            var finalAcc = module.AddInstruction(SpirvOp.Load, u32, acc);
+            module.AddStatement(SpirvOp.Store, output, finalAcc);
+            module.AddStatement(SpirvOp.Return);
+            module.EndFunction();
+
+            var spirv = module.Build();
+            Gen5MipStatisticsTests.ValidateWhenAvailable(spirv);
+            var inspected = new SpirvModuleInspector(spirv);
+            Assert.False(inspected.VariableStorageClasses.ContainsKey(acc));
+            Assert.False(inspected.VariableStorageClasses.ContainsKey(counter));
+
+            var instructions = Instructions(spirv);
+            Assert.DoesNotContain(instructions, words =>
+                (SpirvOp)(words[0] & 0xffff) == SpirvOp.Load && (words[3] == acc || words[3] == counter));
+            Assert.DoesNotContain(instructions, words =>
+                (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && (words[1] == acc || words[1] == counter));
+
+            var phis = instructions.Where(words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Phi).ToArray();
+            Assert.Equal(2, phis.Length);
+            Assert.Contains(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && words[1] == output);
+        }
+        finally
+        {
+            SpirvModuleBuilder.KeepsUnreadVariables = previous;
+        }
+    }
+
+    [Fact]
+    public void CrossBlockDeadStoresToPromotedPrivateVariableDropUpstreamProducers()
+    {
+        var previous = SpirvModuleBuilder.KeepsUnreadVariables;
+        SpirvModuleBuilder.KeepsUnreadVariables = false;
+        try
+        {
+            var module = new SpirvModuleBuilder { InheritBlockState = false };
+            module.AddCapability(SpirvCapability.Shader);
+            var u32 = module.TypeInt(32, false);
+            var boolean = module.TypeBool();
+            var scratch = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, u32), SpirvStorageClass.Private);
+            var input = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Input, u32), SpirvStorageClass.Input);
+            var output = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Output, u32), SpirvStorageClass.Output);
+            module.AddDecoration(input, SpirvDecoration.Location, 0);
+            module.AddDecoration(input, SpirvDecoration.Flat);
+            module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+            var function = module.BeginFunction(module.TypeVoid(), module.TypeFunction(module.TypeVoid()));
+            module.AddEntryPoint(SpirvExecutionModel.Vertex, function, "main", [scratch, input, output]);
+            module.AddLabel();
+
+            var inVal = module.AddInstruction(SpirvOp.Load, u32, input);
+            var deadEntryExpr = module.AddInstruction(SpirvOp.IMul, u32, inVal, module.Constant(u32, 13));
+            module.AddStatement(SpirvOp.Store, scratch, deadEntryExpr);
+
+            var cond = module.AddInstruction(SpirvOp.INotEqual, boolean, inVal, module.Constant(u32, 0));
+            var left = module.AllocateId();
+            var right = module.AllocateId();
+            var merge = module.AllocateId();
+            module.AddStatement(SpirvOp.SelectionMerge, merge, 0);
+            module.AddStatement(SpirvOp.BranchConditional, cond, left, right);
+
+            module.AddLabel(left);
+            var liveLeft = module.AddInstruction(SpirvOp.IAdd, u32, inVal, module.Constant(u32, 1));
+            module.AddStatement(SpirvOp.Store, scratch, liveLeft);
+            module.AddStatement(SpirvOp.Branch, merge);
+
+            module.AddLabel(right);
+            var liveRight = module.AddInstruction(SpirvOp.IAdd, u32, inVal, module.Constant(u32, 2));
+            module.AddStatement(SpirvOp.Store, scratch, liveRight);
+            module.AddStatement(SpirvOp.Branch, merge);
+
+            module.AddLabel(merge);
+            var merged = module.AddInstruction(SpirvOp.Load, u32, scratch);
+            module.AddStatement(SpirvOp.Store, output, merged);
+            var deadFinalExpr = module.AddInstruction(SpirvOp.IMul, u32, inVal, module.Constant(u32, 29));
+            module.AddStatement(SpirvOp.Store, scratch, deadFinalExpr);
+            module.AddStatement(SpirvOp.Return);
+            module.EndFunction();
+
+            var spirv = module.Build();
+            Gen5MipStatisticsTests.ValidateWhenAvailable(spirv);
+            var inspected = new SpirvModuleInspector(spirv);
+            Assert.False(inspected.VariableStorageClasses.ContainsKey(scratch));
+
+            var instructions = Instructions(spirv);
+            Assert.DoesNotContain(instructions, words =>
+                (SpirvOp)(words[0] & 0xffff) == SpirvOp.Load && words[3] == scratch);
+            Assert.DoesNotContain(instructions, words =>
+                (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && words[1] == scratch);
+            Assert.DoesNotContain(instructions, words =>
+                (SpirvOp)(words[0] & 0xffff) == SpirvOp.IMul && (words[2] == deadEntryExpr || words[2] == deadFinalExpr));
+            Assert.Single(instructions.Where(words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Phi));
+        }
+        finally
+        {
+            SpirvModuleBuilder.KeepsUnreadVariables = previous;
+        }
+    }
+
+    [Fact]
+    public void MarkAndSweepDceCollectsDeadPhiCycle()
+    {
+        var previous = SpirvModuleBuilder.KeepsUnreadVariables;
+        SpirvModuleBuilder.KeepsUnreadVariables = false;
+        try
+        {
+            var module = new SpirvModuleBuilder();
+            module.AddCapability(SpirvCapability.Shader);
+            var u32 = module.TypeInt(32, false);
+            var boolean = module.TypeBool();
+            var liveCounter = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, u32), SpirvStorageClass.Private);
+            var deadAccum = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, u32), SpirvStorageClass.Private);
+            var input = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Input, u32), SpirvStorageClass.Input);
+            var output = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Output, u32), SpirvStorageClass.Output);
+            module.AddDecoration(input, SpirvDecoration.Location, 0);
+            module.AddDecoration(input, SpirvDecoration.Flat);
+            module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+            var function = module.BeginFunction(module.TypeVoid(), module.TypeFunction(module.TypeVoid()));
+            module.AddEntryPoint(SpirvExecutionModel.Vertex, function, "main", [liveCounter, deadAccum, input, output]);
+            module.AddLabel();
+
+            var zero = module.Constant(u32, 0);
+            var one = module.Constant(u32, 1);
+            var seven = module.Constant(u32, 7);
+            var limit = module.AddInstruction(SpirvOp.Load, u32, input);
+            var header = module.AllocateId();
+            var latch = module.AllocateId();
+            var done = module.AllocateId();
+            module.DeclareLoopHeader(header);
+
+            module.AddStatement(SpirvOp.Store, liveCounter, zero);
+            module.AddStatement(SpirvOp.Store, deadAccum, zero);
+            module.AddStatement(SpirvOp.Branch, header);
+
+            module.AddLabel(header);
+            var curLive = module.AddInstruction(SpirvOp.Load, u32, liveCounter);
+            var cond = module.AddInstruction(SpirvOp.ULessThan, boolean, curLive, limit);
+            module.AddStatement(SpirvOp.LoopMerge, done, latch, 0);
+            module.AddStatement(SpirvOp.BranchConditional, cond, latch, done);
+
+            module.AddLabel(latch);
+            var nextLive = module.AddInstruction(SpirvOp.IAdd, u32, curLive, one);
+            module.AddStatement(SpirvOp.Store, liveCounter, nextLive);
+            // Self-referential dead accumulator: promoted to a Phi <-> IMul cycle that is never observed.
+            var curDead = module.AddInstruction(SpirvOp.Load, u32, deadAccum);
+            var nextDead = module.AddInstruction(SpirvOp.IMul, u32, curDead, seven);
+            module.AddStatement(SpirvOp.Store, deadAccum, nextDead);
+            module.AddStatement(SpirvOp.Branch, header);
+
+            module.AddLabel(done);
+            var result = module.AddInstruction(SpirvOp.Load, u32, liveCounter);
+            module.AddStatement(SpirvOp.Store, output, result);
+            module.AddStatement(SpirvOp.Return);
+            module.EndFunction();
+
+            var spirv = module.Build();
+            Gen5MipStatisticsTests.ValidateWhenAvailable(spirv);
+            var inspected = new SpirvModuleInspector(spirv);
+            Assert.False(inspected.VariableStorageClasses.ContainsKey(liveCounter));
+            Assert.False(inspected.VariableStorageClasses.ContainsKey(deadAccum));
+
+            var instructions = Instructions(spirv);
+            // Only the live loop counter Phi survives; the dead accumulator Phi and its IMul cycle are swept.
+            Assert.Single(instructions.Where(words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Phi));
+            Assert.DoesNotContain(instructions, words =>
+                (SpirvOp)(words[0] & 0xffff) == SpirvOp.IMul && words[2] == nextDead);
+        }
+        finally
+        {
+            SpirvModuleBuilder.KeepsUnreadVariables = previous;
+        }
+    }
+
+    [Fact]
+    public void MultiFunctionShaderPreservesSharedPrivateVariableWhilePromotingSingleFunctionPrivateVariable()
+    {
+        var previous = SpirvModuleBuilder.KeepsUnreadVariables;
+        SpirvModuleBuilder.KeepsUnreadVariables = false;
+        try
+        {
+            var module = new SpirvModuleBuilder();
+            module.AddCapability(SpirvCapability.Shader);
+            var voidType = module.TypeVoid();
+            var fnType = module.TypeFunction(voidType);
+            var u32 = module.TypeInt(32, false);
+            var boolean = module.TypeBool();
+            var sharedVar = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, u32), SpirvStorageClass.Private);
+            var localOnlyVar = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, u32), SpirvStorageClass.Private);
+            var input = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Input, u32), SpirvStorageClass.Input);
+            var output = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Output, u32), SpirvStorageClass.Output);
+            module.AddDecoration(input, SpirvDecoration.Location, 0);
+            module.AddDecoration(input, SpirvDecoration.Flat);
+            module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+            var helper = module.BeginFunction(voidType, fnType, 2); // DontInline.
+            module.AddLabel();
+            var helperRead = module.AddInstruction(SpirvOp.Load, u32, sharedVar);
+            var helperUpdated = module.AddInstruction(SpirvOp.IAdd, u32, helperRead, module.Constant(u32, 5));
+            module.AddStatement(SpirvOp.Store, sharedVar, helperUpdated);
+            module.AddStatement(SpirvOp.Return);
+            module.EndFunction();
+
+            var main = module.BeginFunction(voidType, fnType);
+            module.AddEntryPoint(SpirvExecutionModel.Vertex, main, "main", [sharedVar, localOnlyVar, input, output]);
+            module.AddLabel();
+
+            var limit = module.AddInstruction(SpirvOp.Load, u32, input);
+            var header = module.AllocateId();
+            var latch = module.AllocateId();
+            var done = module.AllocateId();
+            module.DeclareLoopHeader(header);
+
+            module.AddStatement(SpirvOp.Store, sharedVar, module.Constant(u32, 10));
+            module.AddStatement(SpirvOp.Store, localOnlyVar, module.Constant(u32, 0));
+            module.AddStatement(SpirvOp.Branch, header);
+
+            module.AddLabel(header);
+            var curLocal = module.AddInstruction(SpirvOp.Load, u32, localOnlyVar);
+            var cond = module.AddInstruction(SpirvOp.ULessThan, boolean, curLocal, limit);
+            module.AddStatement(SpirvOp.LoopMerge, done, latch, 0);
+            module.AddStatement(SpirvOp.BranchConditional, cond, latch, done);
+
+            module.AddLabel(latch);
+            module.AddInstruction(SpirvOp.FunctionCall, voidType, helper);
+            var nextLocal = module.AddInstruction(SpirvOp.IAdd, u32, curLocal, module.Constant(u32, 1));
+            module.AddStatement(SpirvOp.Store, localOnlyVar, nextLocal);
+            module.AddStatement(SpirvOp.Branch, header);
+
+            module.AddLabel(done);
+            var finalShared = module.AddInstruction(SpirvOp.Load, u32, sharedVar);
+            var finalLocal = module.AddInstruction(SpirvOp.Load, u32, localOnlyVar);
+            module.AddStatement(SpirvOp.Store, output, module.AddInstruction(SpirvOp.IAdd, u32, finalShared, finalLocal));
+            module.AddStatement(SpirvOp.Return);
+            module.EndFunction();
+
+            var spirv = module.Build();
+            Gen5MipStatisticsTests.ValidateWhenAvailable(spirv);
+            var inspected = new SpirvModuleInspector(spirv);
+            Assert.True(inspected.VariableStorageClasses.ContainsKey(sharedVar));
+            Assert.False(inspected.VariableStorageClasses.ContainsKey(localOnlyVar));
+
+            var instructions = Instructions(spirv);
+            Assert.Contains(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && words[1] == sharedVar);
+            Assert.Contains(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Load && words[3] == sharedVar);
+            Assert.DoesNotContain(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && words[1] == localOnlyVar);
+            Assert.DoesNotContain(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Load && words[3] == localOnlyVar);
+            Assert.Single(instructions.Where(words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Phi));
+        }
+        finally
+        {
+            SpirvModuleBuilder.KeepsUnreadVariables = previous;
+        }
+    }
+
+    [Fact]
+    public void MarkImmutableVariableEnablesCseOfRepeatedStorageBufferLoads()
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+        var u32 = module.TypeInt(32, false);
+        var runtimeArray = module.TypeRuntimeArray(u32);
+        module.AddDecoration(runtimeArray, SpirvDecoration.ArrayStride, 4);
+        var bufferStruct = module.TypeStruct(runtimeArray);
+        module.AddDecoration(bufferStruct, SpirvDecoration.Block);
+        module.AddMemberDecoration(bufferStruct, 0, SpirvDecoration.Offset, 0);
+        var bufferPtr = module.TypePointer(SpirvStorageClass.StorageBuffer, bufferStruct);
+        var elemPtr = module.TypePointer(SpirvStorageClass.StorageBuffer, u32);
+        var ssbo = module.AddGlobalVariable(bufferPtr, SpirvStorageClass.StorageBuffer);
+        module.AddDecoration(ssbo, SpirvDecoration.DescriptorSet, 0);
+        module.AddDecoration(ssbo, SpirvDecoration.Binding, 0);
+        module.AddDecoration(ssbo, SpirvDecoration.NonWritable);
+        module.MarkImmutableVariable(ssbo);
+
+        var input = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Input, u32), SpirvStorageClass.Input);
+        var output = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Output, u32), SpirvStorageClass.Output);
+        module.AddDecoration(input, SpirvDecoration.Location, 0);
+        module.AddDecoration(input, SpirvDecoration.Flat);
+        module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+        var function = module.BeginFunction(module.TypeVoid(), module.TypeFunction(module.TypeVoid()));
+        module.AddEntryPoint(SpirvExecutionModel.Vertex, function, "main", [ssbo, input, output]);
+        module.AddLabel();
+
+        var zero = module.Constant(u32, 0);
+        var idx = module.AddInstruction(SpirvOp.Load, u32, input);
+        var ptr1 = module.AddInstruction(SpirvOp.AccessChain, elemPtr, ssbo, zero, idx);
+        var first = module.AddInstruction(SpirvOp.Load, u32, ptr1);
+        var ptr2 = module.AddInstruction(SpirvOp.AccessChain, elemPtr, ssbo, zero, idx);
+        var second = module.AddInstruction(SpirvOp.Load, u32, ptr2);
+
+        var nextBlock = module.AllocateId();
+        module.AddStatement(SpirvOp.Branch, nextBlock);
+        module.AddLabel(nextBlock);
+        var ptr3 = module.AddInstruction(SpirvOp.AccessChain, elemPtr, ssbo, zero, idx);
+        var third = module.AddInstruction(SpirvOp.Load, u32, ptr3);
+
+        var sum = module.AddInstruction(SpirvOp.IAdd, u32, module.AddInstruction(SpirvOp.IAdd, u32, first, second), third);
+        module.AddStatement(SpirvOp.Store, output, sum);
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        Assert.Equal(first, second);
+        Assert.Equal(first, third);
+
+        var spirv = module.Build();
+        Gen5MipStatisticsTests.ValidateWhenAvailable(spirv);
+        var instructions = Instructions(spirv);
+        var ssboLoads = instructions.Where(words =>
+            (SpirvOp)(words[0] & 0xffff) == SpirvOp.Load && words[3] == ptr1).ToArray();
+        Assert.Single(ssboLoads);
+    }
+
     private static uint[][] Instructions(byte[] code)
     {
         var words = new uint[code.Length / sizeof(uint)];
