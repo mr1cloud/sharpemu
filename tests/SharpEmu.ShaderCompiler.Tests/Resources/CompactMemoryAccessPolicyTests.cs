@@ -93,6 +93,75 @@ public sealed class CompactMemoryAccessPolicyTests
         Assert.Equal(32, CompactMemoryAccessPolicy.CountDeviceAddressDwords(formattedWritePlan));
     }
 
+    [Fact]
+    public void SingleComponentFormattedDeviceLoadGetsMinimumWeight()
+    {
+        var plan = Extract(Program(
+            MoveVector(0x00, 0, 0),
+            BufferLoad(0x08, 20, dwords: 1, formatted: true),
+            EndProgram(0x10)));
+        Assert.NotEmpty(plan.Memory.Entries);
+        foreach (var entry in plan.Memory.Entries)
+        {
+            entry.DeviceDescriptor = true;
+        }
+
+        Assert.Equal(16, CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan));
+        Assert.Equal(32, CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan, pairedWave64: true));
+    }
+
+    [Fact]
+    public void SubdwordGlobalLoadGetsWeightTwo()
+    {
+        var plan = Extract(Program(
+            MoveScalar(0x00, 12, unchecked((uint)InputAddress)),
+            MoveScalar(0x08, 13, (uint)(InputAddress >> 32)),
+            MoveVector(0x10, 0, 0),
+            GlobalMemory(0x18, "GlobalLoadUbyte", 12, 0, 1, 0),
+            EndProgram(0x20)), userDataCount: 0);
+        Assert.Equal(2, CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan));
+        Assert.Equal(4, CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan, pairedWave64: true));
+    }
+
+    [Fact]
+    public void PairedWave64DoublesVectorAccessesButKeepsScalarAddressSingleCounted()
+    {
+        var program = Program(
+            ScalarLoad(0x00, 0, 16, count: 1),
+            MoveScalar(0x08, 12, unchecked((uint)InputAddress)),
+            MoveScalar(0x10, 13, (uint)(InputAddress >> 32)),
+            MoveVector(0x18, 0, 0),
+            GlobalMemory(0x20, "GlobalLoadDword", 12, 0, 1, 0),
+            BufferLoad(0x28, 20, dwords: 1),
+            Vop3(0x30, "VAddU32", 2, Gen5Operand.Vector(1), Gen5Operand.Scalar(16)),
+            EndProgram(0x38));
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, Hash, 0, 24, scalarDataOnDevice: true);
+        Assert.Contains(plan.Memory.Entries, entry => !entry.PlanningOnly && entry.Kind == MemoryResourceKind.ScalarAddress);
+        Assert.Contains(plan.Memory.Entries, entry => !entry.PlanningOnly && entry.Kind == MemoryResourceKind.Global);
+
+        // Before marking the buffer as a device descriptor: 1 ScalarAddress + 1 Global.
+        Assert.Equal(2, CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan, pairedWave64: false));
+        Assert.Equal(3, CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan, pairedWave64: true));
+
+        foreach (var entry in plan.Memory.Entries.Where(static entry => entry.Kind == MemoryResourceKind.Buffer))
+        {
+            entry.DeviceDescriptor = true;
+        }
+
+        // With Buffer DeviceDescriptor: 1 ScalarAddress + 1 Global + 1 Buffer => 3 unpaired, 5 paired.
+        Assert.Equal(3, CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan, pairedWave64: false));
+        Assert.Equal(5, CompactMemoryAccessPolicy.CountDeviceAddressDwords(plan, pairedWave64: true));
+        Assert.False(CompactMemoryAccessPolicy.Prefers(plan, ShaderStage.Compute, 4, pairedWave64: false));
+        Assert.True(CompactMemoryAccessPolicy.Prefers(plan, ShaderStage.Compute, 4, pairedWave64: true));
+
+        // Extract forwards pairedWave64 into CompactMemoryAccessPolicy.Prefers.
+        var half = CopyProgram(CompactMemoryAccessPolicy.DefaultThreshold / 2);
+        var unpairedPlan = ShaderResourcePlan.Extract(half, ShaderStage.Compute, Hash, 0, 0, scalarDataOnDevice: false, pairedWave64: false);
+        var pairedPlan = ShaderResourcePlan.Extract(half, ShaderStage.Compute, Hash, 0, 0, scalarDataOnDevice: false, pairedWave64: true);
+        Assert.False(unpairedPlan.Info.UsesDeviceAddressFallback);
+        Assert.True(pairedPlan.Info.UsesDeviceAddressFallback);
+    }
+
     // A program that reads few dwords through device addresses keeps the default lowering, whatever its number of
     // bound-buffer accesses: compact access would not remove its branches, and a changed module misses the driver's
     // pipeline cache once.

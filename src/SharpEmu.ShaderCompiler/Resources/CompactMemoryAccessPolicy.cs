@@ -19,11 +19,10 @@ namespace SharpEmu.ShaderCompiler.Resources;
 // removing a significant number of blocks.
 public static class CompactMemoryAccessPolicy
 {
-    // Device-address dwords of a compute program at or above which compact access is chosen. The count undercounts what
-    // the default lowering emits (it resolved 2.5 to 8 times as many pages in the programs measured). In the Ghost of Yotei
-    // compute corpus no program counts between 80 and 280, and the programs at 281 or more lowered by default to 9,000 or
-    // more blocks each.
-    public const int DefaultThreshold = 256;
+    // Device-address dwords of a compute program at or above which compact access is chosen. The count models the
+    // page-table lookups the default lowering emits, including paired wave64 lane doubling, formatted device loads/stores,
+    // subdword device accesses, and BVH ray intersections.
+    public const int DefaultThreshold = 128;
 
     public const string EnvironmentVariable = "SHARPEMU_COMPACT_MEMORY_ACCESS_THRESHOLD";
 
@@ -53,8 +52,9 @@ public static class CompactMemoryAccessPolicy
     }
 
     // Data dwords of the tracked accesses that go through the device-address page table: buffers whose descriptors are
-    // read from device memory, and global, flat and scalar-address accesses. Scratch is the invocation's own.
-    public static int CountDeviceAddressDwords(ShaderResourcePlan plan)
+    // read from device memory, BVH ray intersections, and global, flat and scalar-address accesses. Scratch is the
+    // invocation's own. When pairedWave64 is true, vector memory accesses are emitted for both 32-lane halves.
+    public static int CountDeviceAddressDwords(ShaderResourcePlan plan, bool pairedWave64 = false)
     {
         ArgumentNullException.ThrowIfNull(plan);
         var count = 0;
@@ -65,35 +65,64 @@ public static class CompactMemoryAccessPolicy
                 continue;
             }
 
+            var dwords = (int)Math.Max(1u, memory.DataDwords);
+            int weight;
             if (memory.DeviceDescriptor)
             {
-                var dwords = (int)Math.Max(1u, memory.DataDwords);
                 if (memory.Formatted || memory.Typed)
                 {
                     // Non-compact formatted device loads issue two page-table lookups per component plus inline
-                    // format decoding (~80 blocks per xyzw load); formatted device stores expand across format
-                    // shapes with masked atomic CAS loops.
-                    count += memory.Access == MemoryAccess.Read ? dwords * 4 : Math.Max(32, dwords * 8);
+                    // format decoding (~80 blocks per load); formatted device stores expand across format shapes
+                    // with masked atomic CAS loops.
+                    weight = memory.Access == MemoryAccess.Read ? Math.Max(16, dwords * 4) : Math.Max(32, dwords * 8);
+                }
+                else if (memory.DataBits is > 0 and < 32)
+                {
+                    // Subdword device loads/stores emit two word accesses.
+                    weight = Math.Max(2, dwords);
                 }
                 else
                 {
-                    count += dwords;
+                    weight = dwords;
                 }
+            }
+            else if (memory.Opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay")
+            {
+                // Three ResolveDeviceAddress lookups per ray intersection.
+                weight = 3;
             }
             else if (memory.Kind is MemoryResourceKind.Global or MemoryResourceKind.Flat or MemoryResourceKind.ScalarAddress ||
                 (memory.Kind == MemoryResourceKind.ScalarBuffer && memory.Resource == MemoryAccessInfo.NoResource) ||
                 (memory.Kind == MemoryResourceKind.Buffer &&
                  memory.BufferDescriptor?.ChooseStrategy(memory.Typed, memory.Formatted, memory.Access == MemoryAccess.Atomic) == BufferLoweringStrategy.PhysicalStorageBuffer))
             {
-                count += (int)Math.Max(1u, memory.DataDwords);
+                weight = memory.Kind is MemoryResourceKind.Global or MemoryResourceKind.Flat or MemoryResourceKind.Buffer &&
+                    memory.DataBits is > 0 and < 32
+                    ? Math.Max(2, dwords)
+                    : dwords;
             }
+            else
+            {
+                continue;
+            }
+
+            var laneMultiplier = pairedWave64 && IsVectorMemory(memory) ? 2 : 1;
+            count += weight * laneMultiplier;
         }
 
         return count;
     }
 
-    public static bool Prefers(ShaderResourcePlan plan, ShaderStage stage) => Prefers(plan, stage, Threshold);
+    private static bool IsVectorMemory(MemoryAccessInfo memory) =>
+        memory.Kind is MemoryResourceKind.Buffer or MemoryResourceKind.Global or MemoryResourceKind.Flat ||
+        memory.Opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay";
 
-    public static bool Prefers(ShaderResourcePlan plan, ShaderStage stage, int threshold) =>
-        stage == ShaderStage.Compute && threshold != int.MaxValue && CountDeviceAddressDwords(plan) >= threshold;
+    public static bool Prefers(ShaderResourcePlan plan, ShaderStage stage) =>
+        Prefers(plan, stage, Threshold, pairedWave64: false);
+
+    public static bool Prefers(ShaderResourcePlan plan, ShaderStage stage, bool pairedWave64) =>
+        Prefers(plan, stage, Threshold, pairedWave64);
+
+    public static bool Prefers(ShaderResourcePlan plan, ShaderStage stage, int threshold, bool pairedWave64 = false) =>
+        stage == ShaderStage.Compute && threshold != int.MaxValue && CountDeviceAddressDwords(plan, pairedWave64) >= threshold;
 }

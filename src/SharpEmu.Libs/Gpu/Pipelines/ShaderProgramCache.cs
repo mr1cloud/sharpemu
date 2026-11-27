@@ -1587,6 +1587,23 @@ internal sealed partial class ShaderProgramCache
         }
     }
 
+    private static readonly string? PairedWave64Mode = Environment.GetEnvironmentVariable("SHARPEMU_WAVE64_PAIRED");
+
+    // True when a compute program lowers wave64 as paired 32-lane halves (one host invocation per guest lane pair),
+    // which emits every vector memory access twice.
+    private static bool UsesPairedWave64(ComputeInputInfo? info, bool hostWave64Supported, bool hostComputeSubgroup32,
+        Gen5TessellationHullInfo? tessellationHull = null)
+    {
+        if (info is null || info.WaveSize != 64 || tessellationHull is not null ||
+            hostWave64Supported || !hostComputeSubgroup32)
+        {
+            return false;
+        }
+
+        var threads = (ulong)Math.Max(info.ThreadsX, 1) * Math.Max(info.ThreadsY, 1) * Math.Max(info.ThreadsZ, 1);
+        return SharpEmu.ShaderCompiler.Vulkan.Gen5SpirvTranslator.PairsWave64Lanes(PairedWave64Mode, threads);
+    }
+
     private ShaderResourcePlan ExtractPlan(ShaderSource source, StageCompileOptions options, Gen5ShaderProgram program,
         EmbeddedVertexFetchPlan? fetch, bool preferHeapRecords, bool dumpPlanning) =>
         ShaderResourcePlan.Extract(program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
@@ -1605,7 +1622,10 @@ internal sealed partial class ShaderProgramCache
             normalizeBufferDescriptor: source.Registered.Frontend?.NormalizeBufferDescriptor,
             normalizeImageDescriptor: ImageNormalizer(source.Registered.Frontend),
             imageNormalizationVersion: source.Registered.Frontend?.ImageNormalizationVersion,
-            preferHeapRecords: preferHeapRecords);
+            preferHeapRecords: preferHeapRecords,
+            pairedWave64: source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeInfo &&
+                UsesPairedWave64(computeInfo, _host.ComputeWave64SubgroupNative,
+                    _host.ComputeRunsOn32LaneSubgroups(computeInfo), options.TessellationHull));
 
     // A program an earlier session had to replan (PreferHeapRecords) is planned so from the start, as its prewarm record is.
     private bool PrefersHeapRecords(ShaderSource source) =>
@@ -2443,7 +2463,8 @@ internal sealed partial class ShaderProgramCache
                 normalizeBufferDescriptor: frontend?.NormalizeBufferDescriptor,
                 normalizeImageDescriptor: frontend?.NormalizeImageDescriptor,
                 imageNormalizationVersion: frontend?.ImageNormalizationVersion,
-                preferHeapRecords: record.PreferHeapRecords);
+                preferHeapRecords: record.PreferHeapRecords,
+                pairedWave64: UsesPairedWave64(record.Info, hostWave64Supported, hostComputeSubgroup32));
             // A record's storage image selects as the session keeps them (RuntimeImageSwizzle.Canonical).
             var specialization = RuntimeImageSwizzle.Canonical(plan, record.Specialization);
             var resources = ResourceMaterializer.ApplyTo(plan, specialization);
