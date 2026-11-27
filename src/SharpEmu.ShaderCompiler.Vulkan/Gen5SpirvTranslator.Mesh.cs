@@ -22,8 +22,8 @@ public static partial class Gen5SpirvTranslator
         private uint _meshLayerOutput;
         private uint _meshLayerValues;
         private MeshAuxiliaryOutput _meshPointSize;
-        private MeshAuxiliaryOutput _meshClipDistances;
-        private MeshAuxiliaryOutput _meshCullDistances;
+        private MeshDistanceOutput _meshClipDistances;
+        private MeshDistanceOutput _meshCullDistances;
         private uint _meshPrimitiveIndicesOutput;
         private uint _meshCullOutput;
         private uint _meshPrimitiveValue;
@@ -39,6 +39,7 @@ public static partial class Gen5SpirvTranslator
         private (uint Header, uint Continue, uint Merge) _meshBarrierLoop;
 
         private readonly record struct MeshAuxiliaryOutput(uint Type, uint Output, uint FirstHalf, uint SecondHalf);
+        private readonly record struct MeshDistanceOutput(uint Type, uint Output, uint[] FirstHalf, uint[] SecondHalf);
 
         public static (bool Layer, bool PointSize, uint Clip, uint Cull) DescribeMeshAuxiliaryOutputs(ShaderCompileRequest request)
         {
@@ -122,13 +123,13 @@ public static partial class Gen5SpirvTranslator
             if (auxiliary.Clip != 0)
             {
                 _module.AddCapability(SpirvCapability.ClipDistance);
-                _meshClipDistances = DeclareMeshAuxiliaryOutput(_module.TypeArray(_floatType, auxiliary.Clip),
+                _meshClipDistances = DeclareMeshDistanceOutput(auxiliary.Clip,
                     mesh.OutputVertexCapacity, SpirvBuiltIn.ClipDistance);
             }
             if (auxiliary.Cull != 0)
             {
                 _module.AddCapability(SpirvCapability.CullDistance);
-                _meshCullDistances = DeclareMeshAuxiliaryOutput(_module.TypeArray(_floatType, auxiliary.Cull),
+                _meshCullDistances = DeclareMeshDistanceOutput(auxiliary.Cull,
                     mesh.OutputVertexCapacity, SpirvBuiltIn.CullDistance);
             }
             _meshPrimitiveIndicesOutput = DeclareMeshOutput(_uvec3Type, mesh.OutputPrimitiveCapacity,
@@ -192,6 +193,44 @@ public static partial class Gen5SpirvTranslator
 
         private uint MeshAuxiliaryValue(MeshAuxiliaryOutput output) =>
             _logicalHalf == 0 ? output.FirstHalf : output.SecondHalf;
+
+        private MeshDistanceOutput DeclareMeshDistanceOutput(uint count, uint vertices, SpirvBuiltIn builtIn)
+        {
+            var arrayType = _module.TypeArray(_floatType, count);
+            var firstHalf = new uint[count];
+            var secondHalf = _pairedMeshLanes ? new uint[count] : [];
+            for (var index = 0u; index < count; index++)
+            {
+                firstHalf[index] = DeclarePrivateValue(_floatType);
+                if (_pairedMeshLanes)
+                {
+                    secondHalf[index] = DeclarePrivateValue(_floatType);
+                }
+            }
+
+            return new(arrayType, DeclareMeshOutput(arrayType, vertices, builtIn), firstHalf, secondHalf);
+        }
+
+        private uint MeshDistanceValue(MeshDistanceOutput output, uint index) =>
+            (_logicalHalf == 0 ? output.FirstHalf : output.SecondHalf)[index];
+
+        private void CommitMeshDistanceOutput(MeshDistanceOutput output, uint lane)
+        {
+            if (output.Output == 0)
+            {
+                return;
+            }
+
+            var scalars = _logicalHalf == 0 ? output.FirstHalf : output.SecondHalf;
+            var components = new uint[scalars.Length];
+            for (var index = 0; index < scalars.Length; index++)
+            {
+                components[index] = Load(_floatType, scalars[index]);
+            }
+
+            var arrayValue = _module.AddInstruction(SpirvOp.CompositeConstruct, output.Type, components);
+            Store(MeshArrayElement(output.Output, output.Type, lane, SpirvStorageClass.Output), arrayValue);
+        }
 
         private void CommitMeshAuxiliaryOutput(MeshAuxiliaryOutput output, uint lane)
         {
@@ -652,11 +691,9 @@ public static partial class Gen5SpirvTranslator
                         if (output.PointSize)
                             StoreConditional(MeshAuxiliaryValue(_meshPointSize), componentValue, _floatType);
                         if (output.ClipDistance != uint.MaxValue)
-                            StoreConditional(MeshArrayElement(MeshAuxiliaryValue(_meshClipDistances), _floatType,
-                                UInt(output.ClipDistance), SpirvStorageClass.Private), componentValue, _floatType);
+                            StoreConditional(MeshDistanceValue(_meshClipDistances, output.ClipDistance), componentValue, _floatType);
                         if (output.CullDistance != uint.MaxValue)
-                            StoreConditional(MeshArrayElement(MeshAuxiliaryValue(_meshCullDistances), _floatType,
-                                UInt(output.CullDistance), SpirvStorageClass.Private), componentValue, _floatType);
+                            StoreConditional(MeshDistanceValue(_meshCullDistances, output.CullDistance), componentValue, _floatType);
                     }
                 }
                 return true;
@@ -738,8 +775,8 @@ public static partial class Gen5SpirvTranslator
                 Store(MeshArrayElement(_meshPositionOutput, _vec4Type, lane, SpirvStorageClass.Output),
                     Load(_vec4Type, _meshPositionValue));
                 CommitMeshAuxiliaryOutput(_meshPointSize, lane);
-                CommitMeshAuxiliaryOutput(_meshClipDistances, lane);
-                CommitMeshAuxiliaryOutput(_meshCullDistances, lane);
+                CommitMeshDistanceOutput(_meshClipDistances, lane);
+                CommitMeshDistanceOutput(_meshCullDistances, lane);
                 foreach (var (location, (output, value)) in _meshParameters)
                 {
                     var type = ParameterType(location);

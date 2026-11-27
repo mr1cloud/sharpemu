@@ -185,6 +185,7 @@ public static partial class Gen5SpirvTranslator
         private uint _tableBufferLengths;
         private uint _tableFlattenedLength;
         private readonly HashSet<uint> _physicalPointers = [];
+        private readonly Dictionary<string, uint> _indirectImageElementTables = [];
         private uint _deviceEntryScratch;
         private uint _deviceWordScratch;
         private uint _deviceBufferWordScratch;
@@ -2459,14 +2460,32 @@ public static partial class Gen5SpirvTranslator
             {
                 runtimeElement = IAdd(selector, UInt(elements[0].Element));
             }
+            else if (elements.Count <= 16)
+            {
+                // Keep small indirect element mappings in pure SSA selects instead of allocating a
+                // Private array per image access (which paired stages also duplicate across halves).
+                runtimeElement = UInt(elements[0].Element);
+                for (var index = 1; index < elements.Count; index++)
+                {
+                    var match = _module.AddInstruction(SpirvOp.IEqual, _boolType, selector, UInt((uint)index));
+                    runtimeElement = SelectU(match, UInt(elements[index].Element), runtimeElement);
+                }
+            }
             else
             {
-                var tableType = _module.TypeArray(_uintType, (uint)elements.Count);
-                var table = _module.AddGlobalVariable(
-                    _module.TypePointer(SpirvStorageClass.Private, tableType),
-                    SpirvStorageClass.Private,
-                    _module.ConstantComposite(tableType, elements.Select(element => UInt(element.Element)).ToArray()));
-                _interfaces.Add(table);
+                var tableKey = string.Join(',', elements.Select(static element => element.Element));
+                if (!_indirectImageElementTables.TryGetValue(tableKey, out var table))
+                {
+                    var tableType = _module.TypeArray(_uintType, (uint)elements.Count);
+                    table = _module.AddGlobalVariable(
+                        _module.TypePointer(SpirvStorageClass.Private, tableType),
+                        SpirvStorageClass.Private,
+                        _module.ConstantComposite(tableType, elements.Select(element => UInt(element.Element)).ToArray()));
+                    _module.AddName(table, "indirectImageElements");
+                    _interfaces.Add(table);
+                    _indirectImageElementTables.Add(tableKey, table);
+                }
+
                 var slot = _module.AddInstruction(
                     SpirvOp.AccessChain, _module.TypePointer(SpirvStorageClass.Private, _uintType), table, selector);
                 runtimeElement = Load(_uintType, slot);
