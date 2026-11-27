@@ -453,7 +453,7 @@ public sealed partial class DirectExecutionBackend
 				case 3221225501u:
 					Console.Error.WriteLine("[LOADER][INFO]   Type: Illegal Instruction");
 					byte[] illegalCode = new byte[16];
-					if (TryReadHostBytes(rip, illegalCode))
+					if (TryReadExecutableBytes(rip, illegalCode))
 					{
 						Console.Error.WriteLine("[LOADER][INFO]   Code at RIP: " + BitConverter.ToString(illegalCode).Replace("-", " "));
 					}
@@ -1487,7 +1487,17 @@ public sealed partial class DirectExecutionBackend
 			$"state=0x{mbi.State:X08} protect=0x{mbi.Protect:X08} type=0x{mbi.Type:X08}");
 	}
 
-	private unsafe static bool IsReadableHostRange(ulong address, int byteCount, bool allowExecuteOnly = false)
+	private unsafe static bool IsWritableHostRange(ulong address, int byteCount) =>
+		IsAccessibleHostRange(address, byteCount, requireWritable: true, allowExecuteOnly: false);
+
+	private unsafe static bool IsReadableHostRange(ulong address, int byteCount, bool allowExecuteOnly = false) =>
+		IsAccessibleHostRange(address, byteCount, requireWritable: false, allowExecuteOnly: allowExecuteOnly);
+
+	private unsafe static bool IsAccessibleHostRange(
+		ulong address,
+		int byteCount,
+		bool requireWritable,
+		bool allowExecuteOnly)
 	{
 		if (byteCount < 0 || !IsCanonicalUserAddress(address))
 		{
@@ -1500,6 +1510,11 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
+		if (requireWritable && !OperatingSystem.IsWindows())
+		{
+			return true;
+		}
+
 		var end = address + length;
 		var cursor = address;
 		while (cursor < end)
@@ -1508,9 +1523,15 @@ public sealed partial class DirectExecutionBackend
 					(void*)cursor,
 					out var mbi,
 					(nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
-				mbi.State != MEM_COMMIT ||
-				(!IsReadableProtection(mbi.Protect) &&
-				 !(allowExecuteOnly && mbi.Protect == 0x10)))
+				mbi.State != MEM_COMMIT)
+			{
+				return false;
+			}
+
+			var protectionAllowed = requireWritable
+				? IsWritableProtection(mbi.Protect)
+				: IsReadableProtection(mbi.Protect) || (allowExecuteOnly && mbi.Protect == 0x10);
+			if (!protectionAllowed)
 			{
 				return false;
 			}
@@ -1525,6 +1546,18 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		return true;
+	}
+
+	private static bool IsWritableProtection(uint protect)
+	{
+		const uint pageGuard = 0x100;
+		const uint accessMask = 0xFF;
+		if ((protect & pageGuard) != 0)
+		{
+			return false;
+		}
+
+		return (protect & accessMask) is 0x04 or 0x08 or 0x40 or 0x80;
 	}
 
 	private static bool IsCanonicalUserAddress(ulong address) =>

@@ -3367,9 +3367,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private const ulong MaxUserAddress = 0x00007FFFFFFE0000uL;
 	private const uint MEM_FREE = 0x10000u;
 
-	private unsafe void* TryAllocateNearEntry(nuint size)
+	private unsafe void* TryAllocateNearEntry(nuint size) =>
+		TryAllocateNearAddress(_entryPoint, size);
+
+	private unsafe void* TryAllocateNearAddress(ulong targetAddress, nuint size)
 	{
-		ulong baseAddress = _entryPoint & ~(AllocationGranularity - 1);
+		ulong baseAddress = targetAddress & ~(AllocationGranularity - 1);
 		ulong lowLimit = baseAddress > NearEntryWindow ? baseAddress - NearEntryWindow : 0;
 		if (lowLimit < AllocationGranularity)
 		{
@@ -3462,15 +3465,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private readonly record struct TlsPatchCounts(
 		int Loads,
 		int Stores,
-		int StackCanaries)
+		int StackCanaries,
+		int Clzeros = 0)
 	{
-		public int Total => Loads + Stores + StackCanaries;
+		public int Total => Loads + Stores + StackCanaries + Clzeros;
 
 		public static TlsPatchCounts operator +(TlsPatchCounts left, TlsPatchCounts right) =>
 			new(
 				left.Loads + right.Loads,
 				left.Stores + right.Stores,
-				left.StackCanaries + right.StackCanaries);
+				left.StackCanaries + right.StackCanaries,
+				left.Clzeros + right.Clzeros);
 	}
 
 	internal static IReadOnlyList<TlsPatchScanRange> BuildTlsPatchScanRanges(
@@ -3549,13 +3554,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			$"[LOADER][INFO] Patched {counts.Loads} TLS loads, {counts.Stores} TLS stores, " +
 			$"{counts.StackCanaries} stack-canary accesses " +
 			$"across {scannedRanges} executable range(s), bytes=0x{scannedBytes:X}, reused={reusedRanges}, out_of_range={outOfRange}");
+		if (counts.Clzeros > 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] Patched {counts.Clzeros} CLZERO site(s) using {_clzeroTrampolines?.Count ?? 0} trampoline(s) at 0x{_clzeroStubRegion:X16}");
+		}
 		if (outOfRange > 0)
 		{
 			Console.Error.WriteLine($"[LOADER][WARNING] {outOfRange} TLS site(s) are beyond rel32 range of the TLS handler at 0x{_tlsHandlerAddress:X16}.");
 		}
 	}
 
-	private unsafe TlsPatchCounts PatchTlsPatternsInRange(ulong rangeStart, ulong rangeEnd)
+	private unsafe TlsPatchCounts PatchTlsPatternsInRange(ulong rangeStart, ulong rangeEnd) =>
+		PatchTlsPatternsInRange(rangeStart, rangeEnd, patchClzero: !_hostSupportsClzero);
+
+	private unsafe TlsPatchCounts PatchTlsPatternsInRange(ulong rangeStart, ulong rangeEnd, bool patchClzero)
 	{
 		lock (ImportStubPatchGate)
 		{
@@ -3579,7 +3592,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				}
 
 				_tlsWriteBatchRange = allWritable ? new TlsPatchScanRange(rangeStart, rangeEnd) : null;
-				return ScanTlsPatternsInRange(rangeStart, rangeEnd);
+				return ScanTlsPatternsInRange(rangeStart, rangeEnd, patchClzero);
 			}
 			finally
 			{
@@ -3594,10 +3607,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
-	private unsafe TlsPatchCounts ScanTlsPatternsInRange(ulong rangeStart, ulong rangeEnd)
+	private unsafe TlsPatchCounts ScanTlsPatternsInRange(ulong rangeStart, ulong rangeEnd, bool patchClzero)
 	{
 		var cursor = rangeStart;
 		var counts = default(TlsPatchCounts);
+		HashSet<ulong>? branchTargets = null;
+		List<ClzeroPatchCandidate>? clzeroCandidates = null;
 		while (cursor < rangeEnd)
 		{
 			var executableStart = cursor;
@@ -3616,15 +3631,61 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			var reader = new CpuPatcher.UnsafeCodeReader((byte*)executableStart, executableEnd - executableStart);
 			var decoder = Decoder.Create(64, reader);
 			decoder.IP = executableStart;
+			ClzeroPendingCandidate? pendingClzero = null;
 			while (reader.Position < executableEnd - executableStart)
 			{
 				decoder.Decode(out var instruction);
 				if (instruction.Code != Code.INVALID)
 				{
+					if (patchClzero)
+					{
+						if (pendingClzero is { } pending)
+						{
+							if (CanFuseClzeroSuccessor(in instruction, pending.Length))
+							{
+								(clzeroCandidates ??= new List<ClzeroPatchCandidate>()).Add(
+									new ClzeroPatchCandidate(
+										pending.Ip,
+										pending.Length,
+										pending.Is32Bit,
+										instruction.IP,
+										instruction.Length));
+							}
+
+							pendingClzero = null;
+						}
+
+						if (instruction.FlowControl is FlowControl.ConditionalBranch or FlowControl.UnconditionalBranch or FlowControl.Call &&
+							instruction.OpCount > 0 &&
+							instruction.Op0Kind is OpKind.NearBranch16 or OpKind.NearBranch32 or OpKind.NearBranch64)
+						{
+							(branchTargets ??= new HashSet<ulong>()).Add(instruction.NearBranchTarget);
+						}
+
+						if (IsPatchableClzeroInstruction(in instruction, out var is32Bit))
+						{
+							pendingClzero = new ClzeroPendingCandidate(instruction.IP, instruction.Length, is32Bit);
+						}
+					}
+
 					counts += PatchDecodedTlsInstruction(in instruction);
+				}
+				else
+				{
+					pendingClzero = null;
 				}
 			}
 		}
+
+		if (clzeroCandidates is { Count: > 0 })
+		{
+			var patchedClzeros = PatchClzeroCandidatesLocked(clzeroCandidates, branchTargets);
+			if (patchedClzeros > 0)
+			{
+				counts += new TlsPatchCounts(0, 0, 0, patchedClzeros);
+			}
+		}
+
 		return counts;
 	}
 
@@ -7903,6 +7964,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			VirtualFree((void*)_tlsHandlerAddress, 0u, 32768u);
 			_tlsHandlerAddress = 0;
 		}
+		ReleaseClzeroStubRegion();
 		if (_hostRspSlotStorage != 0)
 		{
 			VirtualFree((void*)_hostRspSlotStorage, 0u, 32768u);
