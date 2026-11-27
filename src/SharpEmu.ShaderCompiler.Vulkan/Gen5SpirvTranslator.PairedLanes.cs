@@ -134,10 +134,14 @@ public static partial class Gen5SpirvTranslator
         }
 
         private Dictionary<uint, uint> CurrentVectorRegisterVariables() =>
-            _pairedLanes && _laneHalf == 1 ? _upperVectorRegisterVariables : _vectorRegisterVariables;
+            (_pairedLanes && _laneHalf == 1) || (_pairedMeshLanes && _logicalHalf == 1)
+                ? _upperVectorRegisterVariables
+                : _vectorRegisterVariables;
 
         private string CurrentVectorRegisterPrefix() =>
-            _pairedLanes && _laneHalf == 1 ? "vu" : "v";
+            (_pairedLanes && _laneHalf == 1) || (_pairedMeshLanes && _logicalHalf == 1)
+                ? "vu"
+                : "v";
 
         private uint PairedSubgroupLane() => Load(_uintType, _subgroupInvocationIdInput);
 
@@ -534,11 +538,6 @@ public static partial class Gen5SpirvTranslator
 
         private void DeclarePairedMeshRegisters()
         {
-            if (_stage == Gen5SpirvStage.Mesh)
-            {
-                _vectorRegisterArrayLength = VectorRegisterCount;
-                _vectorRegisters = DeclarePrivateValue(_module.TypeArray(_uintType, VectorRegisterCount));
-            }
             if (_stage != Gen5SpirvStage.Mesh || _request.Mesh?.DeviceSubgroupLaneCount == 0) return;
             _meshSubgroupInput = _module.AddGlobalVariable(
                 _module.TypePointer(SpirvStorageClass.Input, _uintType), SpirvStorageClass.Input);
@@ -550,8 +549,16 @@ public static partial class Gen5SpirvTranslator
             var parameters = new Dictionary<uint, (uint Output, uint Value)>();
             foreach (var (location, parameter) in _meshParameters)
                 parameters.Add(location, (parameter.Output, DeclarePrivateValue(ParameterType(location))));
+            var upperVectors = _vectorRegisters == 0
+                ? 0
+                : DeclarePrivateValue(_module.TypeArray(_uintType, _vectorRegisterArrayLength));
+            if (upperVectors != 0)
+            {
+                _module.AddName(upperVectors, "vgprUpperHalf");
+            }
+
             _meshLaneRegisters.Add(new(
-                DeclarePrivateValue(_module.TypeArray(_uintType, VectorRegisterCount)),
+                upperVectors,
                 0,
                 _scratch == 0 ? 0 : DeclarePrivateValue(_module.TypeArray(_uintType, _scratchDwordCount)),
                 DeclarePrivateValue(_boolType), DeclarePrivateValue(_boolType),
