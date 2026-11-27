@@ -1602,6 +1602,45 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         return new Gen5ComputeSystemRegisters(workGroupX, workGroupY, workGroupZ, threadGroupSize);
     }
 
+    internal void PrestartPreRasterizationLibrary(ResolvedDraw record)
+    {
+        if (record.Kind is not (ResolvedDrawKind.Draw or ResolvedDrawKind.Tessellation) ||
+            record.Context is not { } context ||
+            record.State.Programs is not { Vertex: { IsValid: true } vertexProgram, VertexInput: { Stage.Program: { } vertexStage } vertexInput } ||
+            vertexProgram.Module == 0)
+        {
+            return;
+        }
+
+        // Rectangle lists build their pipelines at draw time.
+        if (record.Topology == PrimitiveTopology.PatchList && vertexInput.Tessellation is null)
+        {
+            return;
+        }
+
+        var mode = context.RasterMode;
+        var cullMode = CullModeFlags.None;
+        if (mode.CullBack)
+        {
+            cullMode |= CullModeFlags.BackBit;
+        }
+
+        if (mode.CullFront)
+        {
+            cullMode |= CullModeFlags.FrontBit;
+        }
+
+        var state = new PreRasterizationState(
+            (int)PolygonMode.Fill,
+            (int)cullMode,
+            (int)(mode.FrontFaceClockwise ? FrontFace.Clockwise : FrontFace.CounterClockwise),
+            DepthClampEnable: false,
+            RasterizerDiscardEnable: false,
+            DepthClipEnable: context.Clip.IsZClipEnabled,
+            NegativeOneToOne: !context.Clip.DirectXClipSpace);
+        _host.PrestartPreRasterizationLibrary(vertexStage, vertexProgram.Module, state, vertexInput.Tessellation);
+    }
+
     public PipelineHandle CreateGraphicsPipeline(
         ReadOnlySpan<ColorTargetState> colors,
         in DepthAttachmentState depth,

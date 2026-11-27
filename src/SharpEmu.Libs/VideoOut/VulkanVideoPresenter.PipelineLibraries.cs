@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
+using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Core.Native;
@@ -43,6 +45,16 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool _earlyPixelLibraries =
             Environment.GetEnvironmentVariable("SHARPEMU_EARLY_PIXEL_LIBRARIES") != "0";
 
+        private static readonly bool _earlyVertexLibraries =
+            Environment.GetEnvironmentVariable("SHARPEMU_EARLY_VERTEX_LIBRARIES") != "0";
+
+        private readonly record struct PreRasterizationLookupKey(
+            ulong Module,
+            ulong TessControlModule,
+            ulong TessEvaluationModule,
+            uint TessControlPoints,
+            PreRasterizationState State);
+
         // Device setup sets this when the device links libraries fast.
         private bool _graphicsPipelineLibraries;
 
@@ -52,6 +64,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly object _graphicsLibraryLock = new();
         private readonly Dictionary<string, Pipeline> _graphicsLibraries = new(StringComparer.Ordinal);
         private readonly Dictionary<string, TaskCompletionSource<Pipeline>> _graphicsLibraryCompiles = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<PreRasterizationLookupKey, byte> _seenPreRasterizations = new();
 
         // The early pixel compiles not yet waited for; teardown waits for them before the modules go.
         private readonly List<Task> _earlyPixelLibraryTasks = new();
@@ -753,6 +766,218 @@ internal static unsafe partial class VulkanVideoPresenter
             return created;
         }
 
+        // A draw with this vertex or mesh program and rasterization state is queued ahead of the render thread: start
+        // compiling its pre-rasterization part on a worker so new vertex shaders in the same frame compile in parallel
+        // instead of one draw after another on the render thread.
+        public void PrestartPreRasterizationLibrary(ShaderProgramInfo program, ulong module, PreRasterizationState state,
+            TessellationPipelineStages? tessellation = null)
+        {
+            if (!_graphicsPipelineLibraries || !_earlyVertexLibraries || program.Bindings is null || module == 0)
+            {
+                return;
+            }
+
+            if (program.MeshTask is { } taskCheck &&
+                (!_supportsTaskShader || program.Stage != ShaderStageKind.Mesh || taskCheck.PrimitivesPerGroup == 0))
+            {
+                return;
+            }
+
+            if (tessellation is { } tessCheck &&
+                (tessCheck.InputControlPoints is 0 or > 32 || tessCheck.Control.Module == 0 || tessCheck.Evaluation.Module == 0))
+            {
+                return;
+            }
+
+            var fastKey = new PreRasterizationLookupKey(
+                module,
+                tessellation?.Control.Module ?? 0,
+                tessellation?.Evaluation.Module ?? 0,
+                tessellation?.InputControlPoints ?? 0,
+                state);
+            if (_seenPreRasterizations.ContainsKey(fastKey) || !_seenPreRasterizations.TryAdd(fastKey, 0))
+            {
+                return;
+            }
+
+            var bindings = new List<DescriptorSetLayoutBinding>();
+            CollectVertexStageBindings(bindings, program, tessellation is not null);
+            var descriptorCount = 0u;
+            foreach (var binding in bindings)
+            {
+                descriptorCount += binding.DescriptorCount;
+            }
+
+            var vertexSetSignature = SetSignature(bindings, bindings.Count != 0 && descriptorCount <= _maxPushDescriptors);
+            var stage = VertexStageInfo(program.Stage == ShaderStageKind.Mesh, new ShaderModule(module), entryPoint: null);
+            var taskSuffix = program.MeshTask is { } launch
+                ? $";task:{launch.PrimitivesPerGroup}:{(launch.PointList ? 1u : 0u)}:{_meshShaderLimits.MaxGroupCountX}:{_meshShaderLimits.MaxGroupCountY}:{_meshShaderLimits.MaxGroupTotalCount}"
+                : "";
+            var tessSuffix = tessellation is { } tess
+                ? $";tess:{tess.Control.Module:X}:{tess.Evaluation.Module:X}:{tess.InputControlPoints}"
+                : "";
+            var clipControl = _supportsDepthClipControl ? state.NegativeOneToOne.ToString() : "-";
+            var depthClip = _supportsDepthClipEnable ? state.DepthClipEnable.ToString() : "-";
+            string dynamicSuffix;
+            var states = BaseDynamicStates;
+            fixed (DynamicState* statePointer = states)
+            {
+                var dynamicState = new PipelineDynamicStateCreateInfo
+                {
+                    SType = StructureType.PipelineDynamicStateCreateInfo,
+                    DynamicStateCount = (uint)states.Length,
+                    PDynamicStates = statePointer,
+                };
+                dynamicSuffix = DynamicKey(&dynamicState);
+            }
+
+            var key = $"pr;{stage.Module.Handle:X};{(int)stage.Stage};{(int)stage.Flags}{taskSuffix}{tessSuffix};{vertexSetSignature};" +
+                $"{clipControl};{state.PolygonMode};{state.CullMode};{state.FrontFace};{depthClip};" +
+                $"{state.DepthClampEnable};{state.RasterizerDiscardEnable};" +
+                dynamicSuffix;
+
+            lock (_graphicsLibraryLock)
+            {
+                if (_graphicsLibraries.ContainsKey(key) || _graphicsLibraryCompiles.ContainsKey(key))
+                {
+                    return;
+                }
+            }
+
+            var label = $"vs=0x{program.Hash:X16} ps=early";
+            var task = Task.Factory.StartNew(
+                () =>
+                {
+                    _pixelLibrarySlots.Wait();
+                    var ok = false;
+                    try
+                    {
+                        ok = CompileEarlyPreRasterizationLibrary(key, program, module, state, tessellation, bindings, label);
+                    }
+                    catch (Exception exception)
+                    {
+                        Console.Error.WriteLine($"[GPU][WARN] Early vertex library failed: {label} {exception.Message}");
+                    }
+                    finally
+                    {
+                        if (!ok)
+                        {
+                            _seenPreRasterizations.TryRemove(fastKey, out _);
+                        }
+
+                        _pixelLibrarySlots.Release();
+                    }
+                },
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+            lock (_earlyPixelLibraryTasks)
+            {
+                _earlyPixelLibraryTasks.RemoveAll(static item => item.IsCompleted);
+                _earlyPixelLibraryTasks.Add(task);
+            }
+        }
+
+        private bool CompileEarlyPreRasterizationLibrary(string key, ShaderProgramInfo program, ulong module,
+            PreRasterizationState state, TessellationPipelineStages? tessellation,
+            List<DescriptorSetLayoutBinding> bindings, string label)
+        {
+            if (TryTakeGraphicsLibrary(key, out _, out var compile))
+            {
+                return true;
+            }
+
+            var created = default(Pipeline);
+            try
+            {
+                created = CreateEarlyPreRasterizationLibrary(program, module, state, tessellation, bindings, label);
+            }
+            finally
+            {
+                FinishGraphicsLibrary(key, compile!, created);
+            }
+
+            return created.Handle != 0;
+        }
+
+        private Pipeline CreateEarlyPreRasterizationLibrary(ShaderProgramInfo program, ulong module,
+            PreRasterizationState state, TessellationPipelineStages? tessellation,
+            List<DescriptorSetLayoutBinding> bindings, string label)
+        {
+            var created = default(Pipeline);
+            DescriptorSetLayout vertexSet = default;
+            PipelineLayout layout = default;
+            var taskEntries = stackalloc SpecializationMapEntry[TaskSpecializationValues];
+            var taskValues = stackalloc uint[TaskSpecializationValues];
+            var taskSpecialization = new SpecializationInfo();
+            var tessellationStages = stackalloc PipelineShaderStageCreateInfo[2];
+            var tessellationState = new PipelineTessellationStateCreateInfo
+            {
+                SType = StructureType.PipelineTessellationStateCreateInfo,
+                PatchControlPoints = tessellation?.InputControlPoints ?? 0,
+            };
+            var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
+            try
+            {
+                if (bindings.Count != 0)
+                {
+                    vertexSet = CreateDescriptorSetLayout(bindings, allowPush: true, out _, out _);
+                }
+
+                layout = CreateLibraryPipelineLayout(vertexSet, default);
+                var stage = VertexStageInfo(program.Stage == ShaderStageKind.Mesh, new ShaderModule(module), entryPoint);
+                var taskStage = program.MeshTask is { } launch
+                    ? TaskStageInfo(launch, taskEntries, taskValues, &taskSpecialization, entryPoint)
+                    : default;
+                if (tessellation is { } tess)
+                {
+                    tessellationStages[0] = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.TessellationControlBit,
+                        Module = new ShaderModule(tess.Control.Module),
+                        PName = entryPoint,
+                    };
+                    tessellationStages[1] = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.TessellationEvaluationBit,
+                        Module = new ShaderModule(tess.Evaluation.Module),
+                        PName = entryPoint,
+                    };
+                }
+
+                created = CreatePreRasterizationLibrary(
+                    stage,
+                    program.MeshTask is null ? null : &taskStage,
+                    state,
+                    layout,
+                    label,
+                    tessellation is null ? null : tessellationStages,
+                    tessellation is null ? null : &tessellationState);
+                if (created.Handle != 0 && tessellation is null)
+                {
+                    RecordPreRasterization(module, state);
+                }
+            }
+            finally
+            {
+                if (layout.Handle != 0)
+                {
+                    _vk.DestroyPipelineLayout(_device, layout, null);
+                }
+
+                if (vertexSet.Handle != 0)
+                {
+                    _vk.DestroyDescriptorSetLayout(_device, vertexSet, null);
+                }
+
+                SilkMarshal.Free((nint)entryPoint);
+            }
+
+            return created;
+        }
+
         private static string PartName(GraphicsPipelineLibraryFlagsEXT part) => part switch
         {
             GraphicsPipelineLibraryFlagsEXT.VertexInputInterfaceBitExt => "vertex-input",
@@ -910,6 +1135,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void DestroyGraphicsLibraries()
         {
             WaitForEarlyPixelLibraries();
+            _seenPreRasterizations?.Clear();
             lock (_graphicsLibraryLock)
             {
                 foreach (var library in _graphicsLibraries.Values)

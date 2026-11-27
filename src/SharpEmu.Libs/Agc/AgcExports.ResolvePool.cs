@@ -568,6 +568,10 @@ public static partial class AgcExports
                     }
 
                     work.Record = worker.Sink.Draw;
+                    if (work.Record is { } resolved)
+                    {
+                        _owner._pipelines!.PrestartPreRasterizationLibrary(resolved);
+                    }
                 }
                 catch (SerialResolveRequiredException serial)
                 {

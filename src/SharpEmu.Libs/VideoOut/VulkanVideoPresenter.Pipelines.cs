@@ -1053,12 +1053,15 @@ internal static unsafe partial class VulkanVideoPresenter
         private static bool UsesBindlessHeap(ShaderProgramInfo program) => program.Bindings?.UsesBindlessHeap == true;
 
         // The bindings of the stage before rasterization, collected before any other stage's.
-        private static void CollectVertexStageBindings(List<DescriptorSetLayoutBinding> bindings, GraphicsPipelineDescription description)
+        private static void CollectVertexStageBindings(List<DescriptorSetLayoutBinding> bindings, GraphicsPipelineDescription description) =>
+            CollectVertexStageBindings(bindings, description.VertexStage, description.Tessellation is not null);
+
+        private static void CollectVertexStageBindings(List<DescriptorSetLayoutBinding> bindings, ShaderProgramInfo vertexStage, bool tessellated)
         {
-            CollectLayoutBindings(bindings, description.VertexStage,
-                description.Tessellation is not null ? ShaderStage.TessellationEvaluation
-                : description.VertexStage.Stage == ShaderStageKind.Mesh ? ShaderStage.Mesh : ShaderStage.Vertex);
-            if (description.Tessellation is not null)
+            CollectLayoutBindings(bindings, vertexStage,
+                tessellated ? ShaderStage.TessellationEvaluation
+                : vertexStage.Stage == ShaderStageKind.Mesh ? ShaderStage.Mesh : ShaderStage.Vertex);
+            if (tessellated)
             {
                 // The control bridge reads the domain stage's runtime data.
                 var dataBinding = BindingLayout.NativeBindingIndex(ShaderStage.TessellationEvaluation, DescriptorBindingKind.ShaderData);
