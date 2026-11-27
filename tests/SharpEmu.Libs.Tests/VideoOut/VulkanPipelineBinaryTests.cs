@@ -3,8 +3,12 @@
 
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.Gpu.Buffers;
+using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Pipelines;
+using SharpEmu.Libs.Gpu.Rendering;
+using SharpEmu.Libs.Gpu.Vulkan;
 using SharpEmu.Libs.Tests.Gpu.Images;
 using SharpEmu.Libs.Tests.Gpu.Vulkan;
 using SharpEmu.ShaderCompiler;
@@ -14,6 +18,7 @@ using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Xunit;
 using static SharpEmu.ShaderCompiler.Tests.Resources.ResourceTestProgram;
+using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
 
 namespace SharpEmu.Libs.Tests.VideoOut;
 
@@ -293,6 +298,137 @@ public sealed class VulkanPipelineBinaryTests(HeadlessVulkanFixture fixture) : I
             presenter.SetField("_device", harnessDevice);
             device.Dispose();
             if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public unsafe void GraphicsPipelineLibraryPartsWithShaderStages_StoreAndReloadFromBinaries()
+    {
+        using var vulkan = HeadlessVulkan.TryCreate(pipelineBinaries: true);
+        if (!GatePrerequisites.Ready(vulkan) || !vulkan.SupportsGraphicsPipelineLibrary)
+        {
+            return;
+        }
+
+        using var presenter = new PresenterUnderTest(vulkan);
+        presenter.SetField("_graphicsPipelineLibraries", true);
+        presenter.LoadRenderingCommands();
+        var directory = Directory.CreateTempSubdirectory("SharpEmuGplBinary");
+        try
+        {
+            presenter.InvokeMethod("InitializePipelineBinaries", directory.FullName);
+            presenter.SetField("_pipelineBinarySlowMilliseconds", 0.0);
+            presenter.SetField("_sharedPipelineBinaryBytes", int.MaxValue);
+
+            var host = (IShaderPipelineHost)presenter.Instance;
+            var pixelModule = host.CreateShaderModule(
+                new VulkanCompiledGuestShader(SpirvFixedShaders.CreateSolidFragment(1f, 0f, 0f, 1f)),
+                ShaderStage.Pixel,
+                1,
+                1);
+            var vertexProgram = new ShaderProgramInfo
+            {
+                Stage = ShaderStageKind.Vertex,
+                Hash = 2,
+                Resources = new SpecializedResourceInfo { Info = new ShaderResourceInfo() },
+                Bindings = BindingLayout.Allocate(new ShaderResourceInfo(), [], false, false, false, 0),
+            };
+            var vertexSpirv = CreateMinimalVertexSpirv();
+            var vertexModule = host.CreateShaderModule(
+                new VulkanCompiledGuestShader(vertexSpirv),
+                ShaderStage.Vertex,
+                2,
+                2);
+            var pixelProgram = new ShaderProgramInfo
+            {
+                Stage = ShaderStageKind.Pixel,
+                Hash = 1,
+                Resources = new SpecializedResourceInfo { Info = new ShaderResourceInfo() },
+                Bindings = BindingLayout.Allocate(new ShaderResourceInfo(), [], false, false, false, 0),
+            };
+            var state = new PreRasterizationState(
+                (int)PolygonMode.Fill,
+                (int)CullModeFlags.None,
+                (int)FrontFace.CounterClockwise,
+                false,
+                false,
+                true,
+                false);
+
+            // First build compiles both shader-bearing libraries and writes their binaries to disk.
+            host.PixelProgramCreated(pixelProgram, pixelModule);
+            host.PrestartPreRasterizationLibrary(vertexProgram, vertexModule, state);
+            presenter.InvokeMethod("WaitForEarlyPixelLibraries");
+
+            var parts = presenter.GetField<Dictionary<string, Pipeline>>("_graphicsLibraries");
+            Assert.Equal(2, parts.Count);
+            Assert.Equal(2, Directory.GetFiles(directory.FullName, "*.bin").Length);
+            Assert.Equal(0, presenter.GetField<int>("_pipelineBinaryLoads"));
+
+            // Destroy the in-memory libraries and clear the seen set; a second build must load both from binaries.
+            presenter.InvokeMethod("DestroyGraphicsLibraries");
+
+            host.PixelProgramCreated(pixelProgram, pixelModule);
+            host.PrestartPreRasterizationLibrary(vertexProgram, vertexModule, state);
+            presenter.InvokeMethod("WaitForEarlyPixelLibraries");
+
+            Assert.Equal(2, parts.Count);
+            Assert.Equal(2, presenter.GetField<int>("_pipelineBinaryLoads"));
+            Assert.Equal(0, presenter.GetField<int>("_pipelineBinaryRefusals"));
+
+            // Link the binary-reloaded shader parts with shaderless vertex-input and color-output parts.
+            var snapshot = new ResourceSnapshot { UserData = [] };
+            var context = new ContextRegisters();
+            var depth = default(DepthAttachmentState);
+            var rendering = new RenderingState { Width = 64, Height = 64, Layers = 1, Samples = 1 };
+            var description = ShaderPipelineCache.BuildGraphicsDescription(
+                ReadOnlySpan<ColorTargetState>.Empty,
+                in depth,
+                new VertexInputInfo { Stage = new ShaderStageResources(vertexProgram, snapshot) },
+                new PixelInputInfo { Stage = new ShaderStageResources(pixelProgram, snapshot) },
+                context,
+                in rendering,
+                PrimitiveTopology.TriangleList,
+                primitiveRestartEnabled: false,
+                disableBlending: true,
+                new ShaderProgram(2, vertexModule),
+                new ShaderProgram(1, pixelModule),
+                SampleCountFlags.Count1Bit);
+            var linked = host.CreateGraphicsPipeline(description);
+            Assert.NotEqual(0UL, linked.Pipeline);
+            Assert.Equal(4, parts.Count);
+            Assert.Equal(2, Directory.GetFiles(directory.FullName, "*.bin").Length);
+            Assert.Equal(2, presenter.GetField<int>("_pipelineBinaryLoads"));
+            Assert.Equal(0, presenter.GetField<int>("_pipelineBinaryRefusals"));
+            vulkan.AssertNoValidationMessages();
+        }
+        finally
+        {
+            presenter.Harness.Finish();
+            presenter.Harness.Shutdown();
+            directory.Delete(recursive: true);
+        }
+
+        static byte[] CreateMinimalVertexSpirv()
+        {
+            var module = new SpirvModuleBuilder();
+            module.AddCapability(SpirvCapability.Shader);
+            var voidType = module.TypeVoid();
+            var floatType = module.TypeFloat(32);
+            var vec4Type = module.TypeVector(floatType, 4);
+            var outputPointer = module.TypePointer(SpirvStorageClass.Output, vec4Type);
+            var position = module.AddGlobalVariable(outputPointer, SpirvStorageClass.Output);
+            module.AddDecoration(position, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.Position);
+            var main = module.BeginFunction(voidType, module.TypeFunction(voidType));
+            module.AddLabel();
+            var zero = module.ConstantFloat(floatType, 0f);
+            var one = module.ConstantFloat(floatType, 1f);
+            var pos = module.AddInstruction(SpirvOp.CompositeConstruct, vec4Type, zero, zero, zero, one);
+            module.AddStatement(SpirvOp.Store, position, pos);
+            module.AddStatement(SpirvOp.Return);
+            module.EndFunction();
+            module.AddEntryPoint(SpirvExecutionModel.Vertex, main, "main", [position]);
+            return module.Build();
         }
     }
 
