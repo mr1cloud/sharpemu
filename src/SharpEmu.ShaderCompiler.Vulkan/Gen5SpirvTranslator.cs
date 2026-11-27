@@ -10132,8 +10132,8 @@ public static partial class Gen5SpirvTranslator
                     inRange,
                     registerIndex,
                     UInt(0));
-                var pointer = _module.AddInstruction(
-                    SpirvOp.AccessChain,
+                var loaded = _module.LoadDynamicArrayElement(
+                    _uintType,
                     _privateUintPointer,
                     _vectorRegisters,
                     safeIndex);
@@ -10141,7 +10141,7 @@ public static partial class Gen5SpirvTranslator
                     SpirvOp.Select,
                     _uintType,
                     inRange,
-                    Load(_uintType, pointer),
+                    loaded,
                     UInt(0));
             }
 
@@ -10175,18 +10175,17 @@ public static partial class Gen5SpirvTranslator
                     inRange,
                     registerIndex,
                     UInt(0));
-                var pointer = _module.AddInstruction(
-                    SpirvOp.AccessChain,
-                    _privateUintPointer,
-                    _vectorRegisters,
-                    safeIndex);
                 var write = _execKnownFull
                     ? inRange
                     : _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, Load(_boolType, _exec), inRange);
-                var current = Load(_uintType, pointer);
+                var current = _module.LoadDynamicArrayElement(
+                    _uintType,
+                    _privateUintPointer,
+                    _vectorRegisters,
+                    safeIndex);
                 var next = _module.AddInstruction(SpirvOp.Select, _uintType, write, value, current);
                 if (_executingWave != 0) next = GuardCooperativeUint(next, current);
-                Store(pointer, next);
+                _module.StoreDynamicArrayElement(_privateUintPointer, _vectorRegisters, safeIndex, next);
                 return;
             }
 

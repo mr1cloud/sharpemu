@@ -263,6 +263,69 @@ public sealed class SpirvOptimizationTests
         Assert.Contains(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && words[1] == output && words[2] == loaded);
     }
 
+    [Fact]
+    public void DynamicArrayElementAccessPreservesConstantIndexTrackingWithoutEscaping()
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+        var integer = module.TypeInt(32, false);
+        var arrayType = module.TypeArray(integer, 4);
+        var privatePtr = module.TypePointer(SpirvStorageClass.Private, integer);
+        var array = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Private, arrayType), SpirvStorageClass.Private);
+        var input = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Input, integer), SpirvStorageClass.Input);
+        var output = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.Output, integer), SpirvStorageClass.Output);
+        module.AddDecoration(input, SpirvDecoration.Location, 0);
+        module.AddDecoration(input, SpirvDecoration.Flat);
+        module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+        var function = module.BeginFunction(module.TypeVoid(), module.TypeFunction(module.TypeVoid()));
+        module.AddEntryPoint(SpirvExecutionModel.Vertex, function, "main", [array, input, output]);
+        module.AddLabel();
+
+        var c0 = module.Constant(integer, 0);
+        var c1 = module.Constant(integer, 1);
+        var c42 = module.Constant(integer, 42);
+        var c99 = module.Constant(integer, 99);
+        var c7 = module.Constant(integer, 7);
+        var c8 = module.Constant(integer, 8);
+        var dynIndex = module.AddInstruction(SpirvOp.Load, integer, input);
+
+        // Store element 0, dynamically load an element (must keep store to 0), then read element 0 again (must forward c42).
+        var ptr0 = module.AddInstruction(SpirvOp.AccessChain, privatePtr, array, c0);
+        module.AddStatement(SpirvOp.Store, ptr0, c42);
+        var dynLoaded = module.LoadDynamicArrayElement(integer, privatePtr, array, dynIndex);
+        var afterDynLoad = module.AddInstruction(SpirvOp.Load, integer, ptr0);
+
+        // Dynamic store invalidates cached element 0, so a read afterwards must reload from memory.
+        module.StoreDynamicArrayElement(privatePtr, array, dynIndex, c99);
+        var afterDynStore = module.AddInstruction(SpirvOp.Load, integer, ptr0);
+
+        // Subsequent constant-index stores to element 1 still get dead-store elimination and forwarding.
+        var ptr1 = module.AddInstruction(SpirvOp.AccessChain, privatePtr, array, c1);
+        module.AddStatement(SpirvOp.Store, ptr1, c7);
+        module.AddStatement(SpirvOp.Store, ptr1, c8);
+        var afterConstStore = module.AddInstruction(SpirvOp.Load, integer, ptr1);
+
+        var sum1 = module.AddInstruction(SpirvOp.IAdd, integer, dynLoaded, afterDynLoad);
+        var sum2 = module.AddInstruction(SpirvOp.IAdd, integer, afterDynStore, afterConstStore);
+        module.AddStatement(SpirvOp.Store, output, module.AddInstruction(SpirvOp.IAdd, integer, sum1, sum2));
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        var spirv = module.Build();
+        Gen5MipStatisticsTests.ValidateWhenAvailable(spirv);
+        var instructions = Instructions(spirv);
+
+        // Element 0 read after LoadDynamicArrayElement forwarded c42 without a second Load;
+        // element 0 read after StoreDynamicArrayElement emitted a fresh Load;
+        // dead store of c7 to ptr1 was eliminated and afterConstStore forwarded c8.
+        Assert.Equal(c42, afterDynLoad);
+        Assert.NotEqual(c42, afterDynStore);
+        Assert.Equal(c8, afterConstStore);
+        Assert.Contains(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && words[1] == ptr0 && words[2] == c42);
+        Assert.DoesNotContain(instructions, words => (SpirvOp)(words[0] & 0xffff) == SpirvOp.Store && words[1] == ptr1 && words[2] == c7);
+    }
+
     private static uint[][] Instructions(byte[] code)
     {
         var words = new uint[code.Length / sizeof(uint)];
