@@ -34,7 +34,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private int _shaderPrewarmFailed;
         private int _shaderPrewarmRuntimeHits;
         private int _shaderPrewarmDroppedLinked;
-        // The background lane of the recorded linked permutations (StartLinkedPrewarm); teardown joins it.
+        // The background lane of the recorded linked permutations (StartLinkedPrewarm); deferred until the
+        // splash-blocking boot prewarm finishes so linked compiles do not steal CPU cores during splash hold.
+        private Action? _pendingLinkedPrewarm;
         private Thread? _linkedPrewarmThread;
         // The splash's warm-up view: the items each kind has done and holds, every lane's threads, and the start.
         private int _shaderPrewarmComputeDone;
@@ -142,8 +144,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 var plain = pending.Where(static item => item.Record.Linked is null).ToList();
                 if (PrewarmLinked == "background")
                 {
-                    StartLinkedPrewarm(list, [.. pending.Where(static item => item.Record.Linked is not null)
-                        .Select(static item => (item.Record, item.Code))], compiler);
+                    var linkedRecords = pending.Where(static item => item.Record.Linked is not null)
+                        .Select(static item => (item.Record, item.Code)).ToArray();
+                    if (linkedRecords.Length != 0)
+                    {
+                        Volatile.Write(ref _pendingLinkedPrewarm, () => StartLinkedPrewarm(list, linkedRecords, compiler));
+                    }
                 }
                 else
                 {
@@ -164,7 +170,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var work = new ShaderPrewarmQueue<(ComputePrewarmRecord Record, ShaderCodeCapture Code, float StartBy)>(pending,
                 static item => item.Record.Linked is null ? null : item.Record.Hash);
-            var workerCount = Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
+            var workerCount = PrewarmWorkerCap;
             var host = (IShaderPipelineHost)this;
             var sharedInt64Atomics = host.SharedInt64AtomicsEnabled;
             var execGuardElision = host.ExecGuardElisionEnabled;
@@ -182,17 +188,10 @@ internal static unsafe partial class VulkanVideoPresenter
             Volatile.Write(ref _shaderPrewarmProgress, 0);
             Volatile.Write(ref _shaderPrewarmComputeTotal, pending.Count);
             Interlocked.Add(ref _shaderPrewarmGraphicsTotal, graphics.Count);
-            Interlocked.Add(ref _shaderPrewarmWorkers, pending.Count != 0 ? workerCount : 0);
             _shaderPrewarmStarted = started;
-            _shaderPrewarmProgressView = ShaderPrewarmProgressView;
-            ShowShaderCacheProgress(_shaderPrewarmProgressView);
-            Console.Error.WriteLine(
-                $"[LOADER][INFO] Shader prewarm started: compute={pending.Count} graphics={graphics.Count} workers={workerCount} " +
-                $"dropped_linked={Volatile.Read(ref _shaderPrewarmDroppedLinked)}");
-            SetShaderPrewarmState(true);
             if (pending.Count != 0)
             {
-                PrewarmWorkers.Add(new PrewarmPool.Lane(pending.Count,
+                var added = PrewarmWorkers.Add(new PrewarmPool.Lane(pending.Count,
                     (out float start) =>
                     {
                         var any = work.TryPeek(out var next);
@@ -228,6 +227,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     },
                     FinishLane),
                     workerCount, "SharpEmu shader prewarm");
+                Interlocked.Add(ref _shaderPrewarmWorkers, added);
             }
 
             if (graphics.Count != 0)
@@ -235,11 +235,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 StartPipelinePrewarm(graphics, compiler, FinishLane);
             }
 
+            _shaderPrewarmProgressView = ShaderPrewarmProgressView;
+            ShowShaderCacheProgress(_shaderPrewarmProgressView);
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Shader prewarm started: compute={pending.Count} graphics={graphics.Count} workers={PrewarmWorkers.WorkerCount} " +
+                $"dropped_linked={Volatile.Read(ref _shaderPrewarmDroppedLinked)}");
+            SetShaderPrewarmState(true);
             return true;
         }
 
-        // The compute and graphics prewarms share one pool of below-normal threads.
-        private PrewarmPool PrewarmWorkers => _prewarmPool ??= new PrewarmPool(() => _shaderPrewarmStopping);
+        private static int PrewarmWorkerCap => Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
+
+        // The compute and graphics prewarms share one capped pool of below-normal threads.
+        private PrewarmPool PrewarmWorkers => _prewarmPool ??= new PrewarmPool(() => _shaderPrewarmStopping, PrewarmWorkerCap);
 
         // The whole pipelines sessions created (RecordGraphics), built again with their stage programs. Each one goes to the
         // device pipeline cache, where the session's creation of the same pipeline finds the driver's compile; the stage
@@ -247,9 +255,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private void StartPipelinePrewarm(IReadOnlyList<PipelinePrewarmItem> items, IGuestGpuBackend compiler, Action finished)
         {
             var work = new ConcurrentQueue<PipelinePrewarmItem>(items);
-            var workerCount = Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
-            Interlocked.Add(ref _shaderPrewarmWorkers, workerCount);
-            PrewarmWorkers.Add(new PrewarmPool.Lane(items.Count,
+            var workerCount = PrewarmWorkerCap;
+            var added = PrewarmWorkers.Add(new PrewarmPool.Lane(items.Count,
                 (out float start) =>
                 {
                     // Sessions do not time a whole pipeline's first use: it is due as an untimed compute record is (StartBy).
@@ -274,12 +281,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     finished();
                 }),
                 workerCount, "SharpEmu pipeline prewarm");
+            Interlocked.Add(ref _shaderPrewarmWorkers, added);
         }
 
         // The linked permutations earlier sessions recorded, compiled on below-normal threads the game does not wait for. The
         // driver can spend minutes on one, and a compile the session starts at the caller's first dispatch can still be
         // running when the session ends: then nothing is stored, and every session skips the caller's dispatches as long.
-        // Started at boot, a permutation is stored when it finishes (its pipeline binaries, or the caller's linked cache), and
+        // Started once the splash-blocking boot prewarm finishes, a permutation is stored when it finishes (its pipeline binaries, or the caller's linked cache), and
         // the session's request for the same module waits for that compile and loads its result instead of compiling it
         // beside it (the pipeline build gate and LinkedCompileAdmission). Each compile waits for its admission like the
         // session's own. The order is ShaderPrewarmQueue.LinkedLaneOrder: each caller's first record is the one its session
@@ -291,7 +299,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void StartLinkedPrewarm(ShaderPrewarmList list,
             IReadOnlyList<(ComputePrewarmRecord Record, ShaderCodeCapture Code)> records, IGuestGpuBackend compiler)
         {
-            if (records.Count == 0)
+            if (records.Count == 0 || _shaderPrewarmStopping)
             {
                 return;
             }
@@ -374,7 +382,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Priority = ThreadPriority.BelowNormal,
                 Name = "SharpEmu linked prewarm",
             };
-            _linkedPrewarmThread = thread;
+            Volatile.Write(ref _linkedPrewarmThread, thread);
             thread.Start();
         }
 
@@ -822,6 +830,7 @@ internal static unsafe partial class VulkanVideoPresenter
             EndShaderPrewarmProgress();
             if (_shaderPrewarmStopping)
             {
+                Interlocked.Exchange(ref _pendingLinkedPrewarm, null);
                 SetShaderPrewarmState(false);
                 return;
             }
@@ -838,7 +847,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 $"failed={Volatile.Read(ref _shaderPrewarmFailed)} dropped_linked={Volatile.Read(ref _shaderPrewarmDroppedLinked)} " +
                 $"ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} " +
                 $"runtime_compute_modules={runtime.Count} matched={matched}");
+            StartDeferredLinkedPrewarm();
         }
+
+        private void StartDeferredLinkedPrewarm() =>
+            Interlocked.Exchange(ref _pendingLinkedPrewarm, null)?.Invoke();
 
         private void NoteRuntimeComputeModule(string identity)
         {
@@ -864,6 +877,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void StopShaderPrewarm()
         {
             _shaderPrewarmStopping = true;
+            Interlocked.Exchange(ref _pendingLinkedPrewarm, null);
             EndShaderPrewarmProgress();
             SetShaderPrewarmState(false);
             // A worker stops after its current item. Its pipeline create cannot be cancelled and teardown destroys the

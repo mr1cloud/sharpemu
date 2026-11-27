@@ -10,21 +10,36 @@ using SharpEmu.Libs.Gpu.Scheduling;
 // to be ready at its first use. At boot the compute records need far more threads than the graphics parts, and a few
 // long compute compiles can hold every compute thread while short records due in the first seconds wait, so the threads
 // follow the deadlines instead of half going to each lane.
-internal sealed class PrewarmPool(Func<bool> stopping)
+internal sealed class PrewarmPool(Func<bool> stopping, int maxWorkers = int.MaxValue)
 {
     private readonly object _gate = new();
     private readonly List<Thread> _threads = [];
     private Lane[] _lanes = [];
     private bool _started;
 
-    // Adds a lane and threads; every thread serves every lane. Threads added before Start begin there, so their first
-    // turns already see every lane; threads added after it begin at once. A lane without items is finished at once.
-    public void Add(Lane lane, int threads, string name)
+    public int WorkerCount
     {
+        get
+        {
+            lock (_gate)
+            {
+                return _threads.Count;
+            }
+        }
+    }
+
+    // Adds a lane and up to threads workers, capped by maxWorkers across the pool; every thread serves every lane.
+    // Returns the number of threads added. Threads added before Start begin there, so their first turns already see
+    // every lane; threads added after it begin at once. A lane without items is finished at once.
+    public int Add(Lane lane, int threads, string name)
+    {
+        int added;
         lock (_gate)
         {
             Volatile.Write(ref _lanes, [.. _lanes, lane]);
-            for (var index = 0; index < threads; index++)
+            var remaining = Math.Max(0, maxWorkers - _threads.Count);
+            added = Math.Clamp(threads, 0, remaining);
+            for (var index = 0; index < added; index++)
             {
                 var thread = new Thread(Work) { IsBackground = true, Priority = ThreadPriority.BelowNormal, Name = $"{name} {index}" };
                 _threads.Add(thread);
@@ -39,6 +54,8 @@ internal sealed class PrewarmPool(Func<bool> stopping)
         {
             lane.Finish();
         }
+
+        return added;
     }
 
     public void Start()

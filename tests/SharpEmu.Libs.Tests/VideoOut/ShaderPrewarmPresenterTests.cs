@@ -197,4 +197,62 @@ public sealed class ShaderPrewarmPresenterTests(HeadlessVulkanFixture fixture) :
             presenter.InvokeMethod("DestroyGuestPipelineCaches");
         }
     }
+
+    [Fact]
+    public void PrewarmPoolCapsTotalWorkersAcrossLanes()
+    {
+        var log = new ConcurrentQueue<int>();
+        var firstItems = new ConcurrentQueue<int>(Enumerable.Range(0, 16));
+        var secondItems = new ConcurrentQueue<int>(Enumerable.Range(100, 16));
+        var firstFinishes = 0;
+        var secondFinishes = 0;
+        var pool = new SharpEmu.Libs.VideoOut.PrewarmPool(static () => false, maxWorkers: 2);
+
+        var addedFirst = pool.Add(new SharpEmu.Libs.VideoOut.PrewarmPool.Lane(16,
+            (out float start) =>
+            {
+                start = 0;
+                return !firstItems.IsEmpty;
+            },
+            _ =>
+            {
+                if (!firstItems.TryDequeue(out var item))
+                {
+                    return false;
+                }
+
+                log.Enqueue(item);
+                return true;
+            },
+            () => Interlocked.Increment(ref firstFinishes)), 4, "test lane 1");
+
+        var addedSecond = pool.Add(new SharpEmu.Libs.VideoOut.PrewarmPool.Lane(16,
+            (out float start) =>
+            {
+                start = 1;
+                return !secondItems.IsEmpty;
+            },
+            _ =>
+            {
+                if (!secondItems.TryDequeue(out var item))
+                {
+                    return false;
+                }
+
+                log.Enqueue(item);
+                return true;
+            },
+            () => Interlocked.Increment(ref secondFinishes)), 4, "test lane 2");
+
+        Assert.Equal(2, addedFirst);
+        Assert.Equal(0, addedSecond);
+        Assert.Equal(2, pool.WorkerCount);
+
+        pool.Start();
+        pool.Stop();
+
+        Assert.Equal(32, log.Count);
+        Assert.Equal(1, firstFinishes);
+        Assert.Equal(1, secondFinishes);
+    }
 }
