@@ -2165,7 +2165,7 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            FlushDeferredGuards();
+            FlushDeferredGuardsForHalf(CurrentDeferredGuardHalf);
             if (control.Typed || instruction.Opcode.Contains("Format", StringComparison.Ordinal))
             {
                 error = $"runtime buffer descriptor does not support the formatted access {instruction.Opcode}";
