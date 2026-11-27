@@ -197,6 +197,13 @@ internal interface IShaderPipelineHost
     {
     }
 
+    // A draw with this vertex or mesh program and rasterization state is queued ahead of the render thread; the host
+    // can start compiling its pre-rasterization pipeline library on a worker so draws in the same frame overlap.
+    void PrestartPreRasterizationLibrary(ShaderProgramInfo program, ulong module, PreRasterizationState state,
+        TessellationPipelineStages? tessellation = null)
+    {
+    }
+
     // A vertex or mesh program was recorded for the prewarm under prewarmIdentity (ShaderPrewarmList.Identity); the host
     // records the states it compiles the program's pre-rasterization libraries with.
     void VertexProgramRecorded(ulong module, ulong prewarmIdentity)

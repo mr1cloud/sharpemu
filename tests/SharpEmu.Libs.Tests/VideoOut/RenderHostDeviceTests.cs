@@ -192,6 +192,10 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
 
         public void CreateModules() => EnsureModules();
 
+        public ShaderProgramInfo VertexProgramInfo => _vertex;
+
+        public ShaderProgram VertexProgram => _vertexProgram;
+
         public GraphicsPrograms GetGraphicsPrograms(
             RegisterBanks banks,
             ReadOnlySpan<ColorComponentMap> targetExportMapping,
@@ -789,6 +793,68 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
             // The draw added the vertex input, vertex and output parts and linked the pixel part compiled before it.
             Assert.Equal(4, parts.Count);
             Assert.Contains(pixelPart, parts.Values);
+        }
+        finally
+        {
+            GuestGpuMemoryHook.Attach(null);
+        }
+
+        harness.Shutdown();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AVertexProgramsPart_CompilesWhenPrestarted_AndItsDrawLinksIt(bool throughWorkers)
+    {
+        if (!Ready() || !_vulkan.SupportsGraphicsPipelineLibrary)
+        {
+            return;
+        }
+
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.SetField("_graphicsPipelineLibraries", true);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var target = harness.MapBacked(0x10000, ReadWrite);
+        var vertices = harness.MapBacked(0x10000, ReadWrite);
+        var words = RegisterWords.Color(target, Size, Size);
+        harness.Write(vertices, Triangle(-1f, -1f, 3f, -1f, -1f, 3f));
+        var host = (IShaderPipelineHost)presenter.Instance;
+        var provider = new FixedProgramProvider(host, vertices, throughWorkers: throughWorkers);
+        var executor = new RenderExecutor(presenter.RenderHost, provider);
+        var banks = Banks(words);
+        var state = new PreRasterizationState(
+            (int)PolygonMode.Fill,
+            (int)CullModeFlags.None,
+            (int)FrontFace.CounterClockwise,
+            DepthClampEnable: false,
+            RasterizerDiscardEnable: false,
+            DepthClipEnable: banks.Context.Clip.IsZClipEnabled,
+            NegativeOneToOne: !banks.Context.Clip.DirectXClipSpace);
+        GuestGpuMemoryHook.Attach(harness.Gpu);
+        try
+        {
+            presenter.Run(() =>
+            {
+                provider.CreateModules();
+                host.PrestartPreRasterizationLibrary(provider.VertexProgramInfo, provider.VertexProgram.Module, state);
+                // Duplicate prestart for the same module and rasterization state must be a no-op.
+                host.PrestartPreRasterizationLibrary(provider.VertexProgramInfo, provider.VertexProgram.Module, state);
+            });
+            presenter.InvokeMethod("WaitForEarlyPixelLibraries");
+            var parts = presenter.GetField<Dictionary<string, Pipeline>>("_graphicsLibraries");
+            var vertexPart = Assert.Single(parts.Values);
+
+            presenter.Run(() => executor.DrawAuto(1, banks, Draw()));
+            presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+            harness.Finish();
+
+            var pixels = harness.ReadImageBytes(TargetImage(presenter, words));
+            Assert.All(Enumerable.Range(0, (int)(Size * Size)), index => Assert.Equal(Red, BitConverter.ToUInt32(pixels, index * 4)));
+            // The draw added the vertex input, pixel and output parts and linked the prestarted vertex part.
+            Assert.Equal(4, parts.Count);
+            Assert.Contains(vertexPart, parts.Values);
         }
         finally
         {

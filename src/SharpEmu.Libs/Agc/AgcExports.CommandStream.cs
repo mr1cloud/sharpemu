@@ -285,6 +285,7 @@ public static partial class AgcExports
                 owner.LearnDrawWrites(record);
                 if (owner.Producing)
                 {
+                    owner._pipelines!.PrestartPreRasterizationLibrary(record);
                     owner.Sink!.EnqueueDeferred(new ResolvedDrawWork(record), isDraw: true);
                 }
                 else

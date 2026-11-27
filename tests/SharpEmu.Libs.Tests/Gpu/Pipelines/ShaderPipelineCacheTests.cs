@@ -807,4 +807,56 @@ public sealed class ShaderPipelineCacheTests : IDisposable
             programs.Vertex, default, SampleCountFlags.Count1Bit));
         Assert.Contains("without a pixel program", noPixel.Message);
     }
+
+    [Fact]
+    public void PrestartPreRasterizationLibrary_ForwardsDrawRasterizationState_AndSkipsNonPipelines()
+    {
+        var guest = new PipelineTestGuest();
+        var cache = new ShaderPipelineCache(guest.Context, guest.Host, guest.Compiler, guest.Registry);
+        var programs = Programs();
+        programs = new GraphicsPrograms
+        {
+            Vertex = new ShaderProgram(programs.Vertex.Id, 0x1234),
+            Pixel = programs.Pixel,
+            VertexInput = programs.VertexInput,
+            PixelInput = programs.PixelInput,
+        };
+        var banks = Banks();
+        banks.Context.RasterMode.CullBack = true;
+        banks.Context.RasterMode.FrontFaceClockwise = true;
+        banks.Context.Clip.DirectXClipSpace = true;
+
+        var draw = new ResolvedDraw
+        {
+            Kind = ResolvedDrawKind.Draw,
+            Context = banks.Context,
+            Topology = PrimitiveTopology.TriangleList,
+        };
+        draw.State.Programs = programs;
+        cache.PrestartPreRasterizationLibrary(draw);
+
+        var prestarted = Assert.Single(guest.Host.PrestartedPreRasterizations);
+        Assert.Same(programs.VertexInput.Stage.Program, prestarted.Program);
+        Assert.Equal(programs.Vertex.Module, prestarted.Module);
+        Assert.Null(prestarted.Tessellation);
+        Assert.Equal(new PreRasterizationState(
+            (int)PolygonMode.Fill,
+            (int)CullModeFlags.BackBit,
+            (int)FrontFace.Clockwise,
+            DepthClampEnable: false,
+            RasterizerDiscardEnable: false,
+            DepthClipEnable: banks.Context.Clip.IsZClipEnabled,
+            NegativeOneToOne: false), prestarted.State);
+
+        // Skipped, clear and rectangle-list draws must not prestart a pre-rasterization library.
+        draw.Kind = ResolvedDrawKind.Skipped;
+        cache.PrestartPreRasterizationLibrary(draw);
+        draw.Kind = ResolvedDrawKind.ClearColorTargets;
+        cache.PrestartPreRasterizationLibrary(draw);
+        draw.Kind = ResolvedDrawKind.Draw;
+        draw.Topology = PrimitiveTopology.PatchList;
+        cache.PrestartPreRasterizationLibrary(draw);
+
+        Assert.Single(guest.Host.PrestartedPreRasterizations);
+    }
 }

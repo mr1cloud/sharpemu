@@ -91,6 +91,12 @@ internal class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
 
     public void VertexProgramRecorded(ulong module, ulong prewarmIdentity) => RecordedVertexPrograms.Add((module, prewarmIdentity));
 
+    public List<(ShaderProgramInfo Program, ulong Module, PreRasterizationState State, TessellationPipelineStages? Tessellation)> PrestartedPreRasterizations { get; } = new();
+
+    public void PrestartPreRasterizationLibrary(ShaderProgramInfo program, ulong module, PreRasterizationState state,
+        TessellationPipelineStages? tessellation = null) =>
+        PrestartedPreRasterizations.Add((program, module, state, tessellation));
+
     public RenderHostLimits Limits => new(16384, 16384, 16384, 16384);
 
     public bool TryResolveColorOutput(uint dataFormat, uint numberType, uint componentSwap, out Gen5PixelOutputKind outputKind, out Gen5ColorComponentMapping componentMapping)
