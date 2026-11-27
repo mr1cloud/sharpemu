@@ -1113,6 +1113,51 @@ public sealed class Gen5MeshShaderTests
         Assert.Equal(withoutExecHiChange + 1, coalesced);
     }
 
+    [Fact]
+    public void PairedMeshClipDistanceUsesScalarPrivateBackingInsteadOfPrivateArray()
+    {
+        // Position export control: slot 13 exports clip distance 0 in component X (bit 0 = misc/clip0).
+        const uint positionControl = 1u << 11; // V_02881C_CLIP_DIST_ENA_0
+        var instructions = new Gen5ShaderInstruction[]
+        {
+            new(0, Gen5ShaderEncoding.Exp, "Exp", [0, 0],
+                [Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2), Gen5Operand.Vector(3)], [],
+                new Gen5ExportControl(12, 0xFu, false, false, false)),
+            new(8, Gen5ShaderEncoding.Exp, "Exp", [0, 0],
+                [Gen5Operand.Vector(4), Gen5Operand.Vector(0), Gen5Operand.Vector(0), Gen5Operand.Vector(0)], [],
+                new Gen5ExportControl(13, 0x1u, false, false, false)),
+            ResourceTestProgram.EndProgram(16),
+        };
+        var program = ResourceTestProgram.Program(instructions);
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Mesh);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            WaveSize = 64,
+            LocalSizeX = 64,
+            PositionExportControl = positionControl,
+            Mesh = new MeshShaderConfiguration(64, 64, 0, 62, 64, 0, true, 32),
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        ValidateWithInstalledSdk(shader.Spirv);
+
+        var words = new uint[shader.Spirv.Length / sizeof(uint)];
+        Buffer.BlockCopy(shader.Spirv, 0, words, 0, shader.Spirv.Length);
+        var arrayTypes = new HashSet<uint>();
+        var privateArrayPtrs = new HashSet<uint>();
+        var privateArrayVars = 0;
+        for (var offset = 5; offset < words.Length; offset += (int)(words[offset] >> 16))
+        {
+            var op = (SpirvOp)(words[offset] & 0xFFFF);
+            if (op == SpirvOp.TypeArray) arrayTypes.Add(words[offset + 1]);
+            else if (op == SpirvOp.TypePointer && words[offset + 2] == (uint)SpirvStorageClass.Private && arrayTypes.Contains(words[offset + 3]))
+                privateArrayPtrs.Add(words[offset + 1]);
+            else if (op == SpirvOp.Variable && privateArrayPtrs.Contains(words[offset + 1]))
+                privateArrayVars++;
+        }
+
+        Assert.Equal(0, privateArrayVars);
+    }
+
     private sealed class FixtureMemory : ICpuMemory
     {
         private readonly List<(ulong Address, byte[] Data)> _regions = [];
