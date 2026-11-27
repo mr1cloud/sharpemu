@@ -308,8 +308,27 @@ public static partial class AgcExports
                     sink.NoteKnownWrite(known, record.Sequence);
                 }
 
+                // Kick off unseen compute pipeline compiles as dispatches enter the lookahead queue so
+                // multiple slow compute shaders in one frame compile in parallel across worker slots
+                // instead of serializing one by one on the render thread.
+                if (ShouldPrestartComputePipeline(record))
+                {
+                    owner._pipelines!.TryCreateComputePipeline(record.Program.Input, record.Program.Program, out _);
+                }
+
                 sink.EnqueueDeferred(new ResolvedDispatchWork(record), isDraw: false);
             }
+
+            internal static bool ShouldPrestartComputePipeline(ResolvedDispatch record) =>
+                !record.Skipped &&
+                record.Program.Available &&
+                !record.Program.Consumed &&
+                record.Program.ImageCopy is null &&
+                record.Program.Program.IsValid &&
+                (record.IndirectArgumentsAddress != 0 ||
+                 (record.GroupsX != 0 && record.GroupsY != 0 && record.GroupsZ != 0 &&
+                  record.MetadataClear is null && record.ConstantFill is null && record.BoundedFill is null &&
+                  record.BoundedCopy is null && record.ImageClear is null));
         }
 
         public void RunDeferred(DeferredWork work)
