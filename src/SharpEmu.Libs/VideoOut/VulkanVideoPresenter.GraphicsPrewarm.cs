@@ -77,15 +77,10 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _prewarmedGraphicsModules = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             var work = new ConcurrentQueue<GraphicsPrewarmItem>(pending);
-            var workerCount = Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
+            var workerCount = PrewarmWorkerCap;
             var started = Stopwatch.GetTimestamp();
             Interlocked.Add(ref _shaderPrewarmGraphicsTotal, pending.Count);
-            Interlocked.Add(ref _shaderPrewarmWorkers, workerCount);
-            Console.Error.WriteLine(
-                $"[LOADER][INFO] Graphics prewarm started: pixel={pending.Count(static item => item is PixelPrewarmItem)} " +
-                $"pre_rasterization={pending.Count(static item => item is PreRasterizationPrewarmItem)} " +
-                $"resumed={recorded - pending.Count} missing={missing} workers={workerCount}");
-            PrewarmWorkers.Add(new PrewarmPool.Lane(pending.Count,
+            var added = PrewarmWorkers.Add(new PrewarmPool.Lane(pending.Count,
                 (out float start) =>
                 {
                     var any = work.TryPeek(out var next);
@@ -121,6 +116,11 @@ internal static unsafe partial class VulkanVideoPresenter
                         $"stopped={_shaderPrewarmStopping} ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0}");
                 }),
                 workerCount, "SharpEmu graphics prewarm");
+            Interlocked.Add(ref _shaderPrewarmWorkers, added);
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Graphics prewarm started: pixel={pending.Count(static item => item is PixelPrewarmItem)} " +
+                $"pre_rasterization={pending.Count(static item => item is PreRasterizationPrewarmItem)} " +
+                $"resumed={recorded - pending.Count} missing={missing} workers={PrewarmWorkers.WorkerCount}");
         }
 
         private void FlushGraphicsPrewarmProgress(ShaderPrewarmList list, string stamp)
