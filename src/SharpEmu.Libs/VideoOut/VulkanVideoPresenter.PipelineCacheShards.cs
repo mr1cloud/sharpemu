@@ -53,21 +53,24 @@ internal static unsafe partial class VulkanVideoPresenter
         private PipelineCache GetGuestPipelineCache(string key)
             => ResolveGuestPipelineCache(GetGuestPipelineCacheSource(key));
 
-        // The dictionary belongs to the render thread. Only the lazy native
-        // creation runs on compiler workers; variants share one initialization.
+        // Variants share one lazy native cache initialization per key; the map is guarded because
+        // compute and graphics pipeline compilation can start from different threads.
         private Lazy<PipelineCache>? GetGuestPipelineCacheSource(string key)
         {
             if (_pipelineCacheShardDirectory is null) return null;
-            if (_pipelineCacheShards.TryGetValue(key, out var existing))
+            lock (_pipelineCacheShards)
             {
-                existing.Dirty = true;
-                return existing.Cache;
-            }
+                if (_pipelineCacheShards.TryGetValue(key, out var existing))
+                {
+                    existing.Dirty = true;
+                    return existing.Cache;
+                }
 
-            var shard = new DriverCacheShard { Path = Path.Combine(_pipelineCacheShardDirectory, key + ".bin"), Dirty = true };
-            shard.Cache = new Lazy<PipelineCache>(() => LoadGuestPipelineCache(key, shard));
-            _pipelineCacheShards.Add(key, shard);
-            return shard.Cache;
+                var shard = new DriverCacheShard { Path = Path.Combine(_pipelineCacheShardDirectory, key + ".bin"), Dirty = true };
+                shard.Cache = new Lazy<PipelineCache>(() => LoadGuestPipelineCache(key, shard));
+                _pipelineCacheShards.Add(key, shard);
+                return shard.Cache;
+            }
         }
 
         // A linked compile's own pipeline cache, created from its caller's cache file; null when shards keep every pipeline or
@@ -149,7 +152,13 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var savedShards = 0;
             nuint savedBytes = 0;
-            foreach (var shard in _pipelineCacheShards.Values)
+            DriverCacheShard[] shards;
+            lock (_pipelineCacheShards)
+            {
+                shards = [.. _pipelineCacheShards.Values];
+            }
+
+            foreach (var shard in shards)
             {
                 if (!shard.Dirty || !shard.Cache.IsValueCreated || shard.Cache.Value.Handle == 0)
                     continue;
@@ -177,12 +186,18 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DestroyGuestPipelineCaches()
         {
-            foreach (var shard in _pipelineCacheShards.Values)
+            DriverCacheShard[] shards;
+            lock (_pipelineCacheShards)
+            {
+                shards = [.. _pipelineCacheShards.Values];
+                _pipelineCacheShards.Clear();
+            }
+
+            foreach (var shard in shards)
             {
                 if (shard.Cache.IsValueCreated && shard.Cache.Value.Handle != 0)
                     _vk.DestroyPipelineCache(_device, shard.Cache.Value, null);
             }
-            _pipelineCacheShards.Clear();
         }
     }
 }
