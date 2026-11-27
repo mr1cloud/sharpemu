@@ -264,6 +264,36 @@ public sealed partial class SpirvModuleBuilder
         }
     }
 
+    // Dynamically indexed load from a tracked Private array: flushes pending element stores so earlier
+    // constant-index writes remain visible, without permanently escaping the array from SSA tracking.
+    public uint LoadDynamicArrayElement(uint resultType, uint pointerType, uint arrayVariable, uint index)
+    {
+        if (IsTrackedVariable(arrayVariable))
+        {
+            _pendingStores.Remove(arrayVariable);
+            ForgetElements(arrayVariable, keepValues: true);
+        }
+
+        var pointer = EmitResult(_functions, SpirvOp.AccessChain, pointerType, [arrayVariable, index]);
+        return EmitResult(_functions, SpirvOp.Load, resultType, [pointer]);
+    }
+
+    // Dynamically indexed store to a tracked Private array: invalidates cached element values at this
+    // program point without permanently escaping the array from SSA tracking in surrounding code.
+    public void StoreDynamicArrayElement(uint pointerType, uint arrayVariable, uint index, uint value)
+    {
+        if (IsTrackedVariable(arrayVariable))
+        {
+            _variableValues.Remove(arrayVariable);
+            _pendingStores.Remove(arrayVariable);
+            _inheritedPointers.Remove(arrayVariable);
+            ForgetElements(arrayVariable, keepValues: false);
+        }
+
+        var pointer = EmitResult(_functions, SpirvOp.AccessChain, pointerType, [arrayVariable, index]);
+        Emit(_functions, SpirvOp.Store, [pointer, value]);
+    }
+
     private bool TryAddElementPointer(uint resultType, uint[] operands, out uint element)
     {
         element = 0;
