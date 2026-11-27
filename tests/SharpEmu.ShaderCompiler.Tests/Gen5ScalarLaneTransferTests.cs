@@ -355,6 +355,110 @@ public sealed class Gen5ScalarLaneTransferTests
         var opcodes = ReadSpirvOpcodes(compiled.Spirv);
         Assert.Contains((ushort)SpirvOp.IAdd, opcodes);
         Assert.Contains((ushort)SpirvOp.ULessThan, opcodes);
+        Assert.DoesNotContain("vgpr", ReadSpirvNames(compiled.Spirv));
+    }
+
+    [Fact]
+    public void LargeUnboundedRelativeMoveFanOutUsesPrivateVectorArray()
+    {
+        var instructions = new List<Gen5ShaderInstruction>();
+        uint pc = 0;
+        instructions.Add(ScalarInstruction(
+            pc,
+            Gen5ShaderEncoding.Sop1,
+            "SMovB32",
+            [Gen5Operand.Scalar(0)],
+            Gen5Operand.Scalar(124)));
+        pc += 4;
+        for (uint i = 0; i < 16; i++)
+        {
+            instructions.Add(ScalarInstruction(
+                pc,
+                Gen5ShaderEncoding.Vop1,
+                "VMovrelsB32",
+                [Gen5Operand.Vector(12), Gen5Operand.Scalar(124)],
+                Gen5Operand.Vector(120 + i)));
+            pc += 4;
+        }
+        instructions.Add(ScalarInstruction(
+            pc,
+            Gen5ShaderEncoding.Vop1,
+            "VMovreldB32",
+            [Gen5Operand.Vector(120), Gen5Operand.Scalar(124)],
+            Gen5Operand.Vector(12)));
+        pc += 4;
+        instructions.Add(ScalarInstruction(pc, Gen5ShaderEncoding.Sopp, "SEndpgm", []));
+
+        var program = new Gen5ShaderProgram(0x1000, instructions);
+        var request = ResourceTestProgram.Request(program);
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var compiled, out var compileError),
+            compileError);
+
+        ValidateWithInstalledSdk(compiled.Spirv);
+        var names = ReadSpirvNames(compiled.Spirv);
+        Assert.Contains("vgpr", names);
+        var opcodes = ReadSpirvOpcodes(compiled.Spirv);
+        Assert.Contains((ushort)SpirvOp.AccessChain, opcodes);
+        Assert.True(
+            opcodes.Count(static op => op == (ushort)SpirvOp.Select) < 150,
+            "Expected private array indexing instead of expanding linear OpSelect chains.");
+    }
+
+    [Fact]
+    public void LargeUnboundedRelativeMoveFanOutInPairedWave64UsesLowerAndUpperVectorArrays()
+    {
+        var instructions = new List<Gen5ShaderInstruction>();
+        uint pc = 0;
+        instructions.Add(ScalarInstruction(
+            pc,
+            Gen5ShaderEncoding.Sop1,
+            "SMovB32",
+            [Gen5Operand.Scalar(0)],
+            Gen5Operand.Scalar(124)));
+        pc += 4;
+        for (uint i = 0; i < 10; i++)
+        {
+            instructions.Add(ScalarInstruction(
+                pc,
+                Gen5ShaderEncoding.Vop1,
+                "VMovrelsB32",
+                [Gen5Operand.Vector(4), Gen5Operand.Scalar(124)],
+                Gen5Operand.Vector(100 + i)));
+            pc += 4;
+        }
+        instructions.Add(ScalarInstruction(
+            pc,
+            Gen5ShaderEncoding.Vop1,
+            "VMovreldB32",
+            [Gen5Operand.Vector(100), Gen5Operand.Scalar(124)],
+            Gen5Operand.Vector(4)));
+        pc += 4;
+        instructions.Add(ScalarInstruction(pc, Gen5ShaderEncoding.Sopp, "SEndpgm", []));
+
+        var program = new Gen5ShaderProgram(0x1000, instructions);
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            LocalSizeX = 64,
+            ThreadCountX = 64,
+            WaveSize = 64,
+            HostComputeSubgroup32 = true,
+            HostWave64Supported = false,
+        };
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var compiled, out var compileError),
+            compileError);
+
+        ValidateWithInstalledSdk(compiled.Spirv);
+        var names = ReadSpirvNames(compiled.Spirv);
+        Assert.Contains("vgpr", names);
+        Assert.Contains("vgprUpperHalf", names);
+        var opcodes = ReadSpirvOpcodes(compiled.Spirv);
+        Assert.Contains((ushort)SpirvOp.AccessChain, opcodes);
+        Assert.True(
+            opcodes.Count(static op => op == (ushort)SpirvOp.Select) < 200,
+            "Expected paired lower/upper private arrays instead of expanding linear OpSelect chains.");
     }
 
     [Theory]
@@ -466,6 +570,34 @@ public sealed class Gen5ScalarLaneTransferTests
         }
 
         return opcodes;
+    }
+
+    private static HashSet<string> ReadSpirvNames(byte[] spirv)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        for (var offset = 5 * sizeof(uint); offset < spirv.Length;)
+        {
+            var instruction = BinaryPrimitives.ReadUInt32LittleEndian(
+                spirv.AsSpan(offset));
+            var wordCount = checked((int)(instruction >> 16));
+            var opcode = (ushort)instruction;
+            Assert.True(wordCount > 0);
+            if (opcode == (ushort)SpirvOp.Name && wordCount >= 3)
+            {
+                var literalBytes = spirv.AsSpan(offset + 2 * sizeof(uint), (wordCount - 2) * sizeof(uint));
+                var nul = literalBytes.IndexOf((byte)0);
+                if (nul >= 0)
+                {
+                    literalBytes = literalBytes[..nul];
+                }
+
+                names.Add(System.Text.Encoding.UTF8.GetString(literalBytes));
+            }
+
+            offset += wordCount * sizeof(uint);
+        }
+
+        return names;
     }
 
     private sealed class TestCpuMemory(ulong baseAddress, int size) : ICpuMemory

@@ -36,6 +36,8 @@ public static partial class Gen5SpirvTranslator
         private uint _upperVcc;
         private uint _lowerScratch;
         private uint _upperScratch;
+        private uint _lowerVectorRegisters;
+        private uint _upperVectorRegisters;
         private uint _subgroupIdInput;
         private uint _pairedCounterResult;
         private Dictionary<uint, uint>? _scalarSnapshot;
@@ -55,6 +57,10 @@ public static partial class Gen5SpirvTranslator
             if (_lowerScratch != 0)
             {
                 _scratch = half == 0 ? _lowerScratch : _upperScratch;
+            }
+            if (_lowerVectorRegisters != 0)
+            {
+                _vectorRegisters = half == 0 ? _lowerVectorRegisters : _upperVectorRegisters;
             }
         }
 
@@ -89,6 +95,22 @@ public static partial class Gen5SpirvTranslator
                 _module.ConstantNull(arrayType));
             _interfaces.Add(_upperScratch);
             _module.AddName(_upperScratch, "scratchUpperHalf");
+        }
+
+        private void DeclarePairedVectorRegisters(uint arrayPointer, uint arrayType)
+        {
+            _lowerVectorRegisters = _vectorRegisters;
+            if (!_pairedLanes)
+            {
+                return;
+            }
+
+            _upperVectorRegisters = _module.AddGlobalVariable(
+                arrayPointer,
+                SpirvStorageClass.Private,
+                _module.ConstantNull(arrayType));
+            _interfaces.Add(_upperVectorRegisters);
+            _module.AddName(_upperVectorRegisters, "vgprUpperHalf");
         }
 
         private void DeclareComputeSubgroupId()
@@ -513,7 +535,10 @@ public static partial class Gen5SpirvTranslator
         private void DeclarePairedMeshRegisters()
         {
             if (_stage == Gen5SpirvStage.Mesh)
+            {
+                _vectorRegisterArrayLength = VectorRegisterCount;
                 _vectorRegisters = DeclarePrivateValue(_module.TypeArray(_uintType, VectorRegisterCount));
+            }
             if (_stage != Gen5SpirvStage.Mesh || _request.Mesh?.DeviceSubgroupLaneCount == 0) return;
             _meshSubgroupInput = _module.AddGlobalVariable(
                 _module.TypePointer(SpirvStorageClass.Input, _uintType), SpirvStorageClass.Input);

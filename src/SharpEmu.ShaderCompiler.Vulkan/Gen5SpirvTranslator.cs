@@ -172,8 +172,10 @@ public static partial class Gen5SpirvTranslator
         // (V_MOVREL*): MoltenVK lowers a 512-entry private array to thread memory, and every
         // register access of every invocation then spills through it.
         private readonly Dictionary<uint, uint> _scalarRegisterVariables = new();
+        private const uint DynamicVectorSelectBudget = 1024;
         private readonly Dictionary<uint, uint> _vectorRegisterVariables = new();
         private uint _vectorRegisters;
+        private uint _vectorRegisterArrayLength;
         private (uint First, uint Last) _dynamicVectorRange;
         private uint _packedHalfRegisters;
         private uint _scc;
@@ -659,8 +661,21 @@ public static partial class Gen5SpirvTranslator
                 // A dynamically indexed private array cannot live in registers: Metal spills the
                 // whole 2 KiB file to thread memory and every VGPR access becomes a memory access
                 // (Octopath's instanced vertex shader: 112 ms per draw). Keep one variable per
-                // register and resolve V_MOVREL* with a select over the registers the program uses.
+                // register and resolve small V_MOVREL* fan-outs with selects, but fall back to a
+                // sized Private array when unbounded V_MOVREL* select chains would explode SPIR-V
+                // size and driver compile time.
                 _dynamicVectorRange = DynamicVectorRange(_request.Program);
+                if (_stage != Gen5SpirvStage.Mesh && ShouldUseDynamicVectorArray())
+                {
+                    _vectorRegisterArrayLength = Math.Min(_dynamicVectorRange.Last + 16, VectorRegisterCount);
+                    var arrayType = _module.TypeArray(_uintType, _vectorRegisterArrayLength);
+                    var arrayPointer = _module.TypePointer(SpirvStorageClass.Private, arrayType);
+                    _vectorRegisters = _module.AddGlobalVariable(
+                        arrayPointer,
+                        SpirvStorageClass.Private,
+                        _module.ConstantNull(arrayType));
+                    DeclarePairedVectorRegisters(arrayPointer, arrayType);
+                }
             }
 
             // Keep scalar state in uint variables, matching upstream's flag load/store conversion.
@@ -10022,6 +10037,12 @@ public static partial class Gen5SpirvTranslator
         {
             if (_vectorRegisters != 0)
             {
+                if (register >= _vectorRegisterArrayLength)
+                {
+                    throw new InvalidOperationException(
+                        $"Vector register v{register} is outside the allocated register array ({_vectorRegisterArrayLength}).");
+                }
+
                 return _module.AddInstruction(
                     SpirvOp.AccessChain,
                     _privateUintPointer,
@@ -10035,6 +10056,34 @@ public static partial class Gen5SpirvTranslator
             }
 
             return RegisterVariable(CurrentVectorRegisterVariables(), register, CurrentVectorRegisterPrefix());
+        }
+
+        private bool ShouldUseDynamicVectorArray()
+        {
+            var rangeSize = (ulong)(_dynamicVectorRange.Last - _dynamicVectorRange.First + 1);
+            var laneMultiplier = _pairedLanes ? 2ul : 1ul;
+            ulong estimatedSelects = 0;
+            foreach (var instruction in _request.Program.Instructions)
+            {
+                if (instruction.Opcode is not ("VMovrelsB32" or "VMovreldB32" or "VMovrelsdB32" or "VMovrelsd2B32"))
+                {
+                    continue;
+                }
+
+                if (instruction.Opcode != "VMovrelsd2B32" && TryGetMoveRelativeOffsets(instruction.Pc, out _))
+                {
+                    continue;
+                }
+
+                var ops = instruction.Opcode is "VMovrelsdB32" or "VMovrelsd2B32" ? 2ul : 1ul;
+                estimatedSelects += ops * laneMultiplier * rangeSize;
+                if (estimatedSelects > DynamicVectorSelectBudget)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         // The V_MOVREL* opcodes address the VGPR file with a register number that
@@ -10070,6 +10119,32 @@ public static partial class Gen5SpirvTranslator
 
         private uint LoadVDynamic(uint registerIndex)
         {
+            if (_vectorRegisters != 0)
+            {
+                var inRange = _module.AddInstruction(
+                    SpirvOp.ULessThan,
+                    _boolType,
+                    registerIndex,
+                    UInt(_vectorRegisterArrayLength));
+                var safeIndex = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    inRange,
+                    registerIndex,
+                    UInt(0));
+                var pointer = _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _privateUintPointer,
+                    _vectorRegisters,
+                    safeIndex);
+                return _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    inRange,
+                    Load(_uintType, pointer),
+                    UInt(0));
+            }
+
             var result = UInt(0);
             for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
             {
@@ -10087,6 +10162,34 @@ public static partial class Gen5SpirvTranslator
         private void StoreVDynamic(uint registerIndex, uint value)
         {
             _savedLaneValues.Clear();
+            if (_vectorRegisters != 0)
+            {
+                var inRange = _module.AddInstruction(
+                    SpirvOp.ULessThan,
+                    _boolType,
+                    registerIndex,
+                    UInt(_vectorRegisterArrayLength));
+                var safeIndex = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    inRange,
+                    registerIndex,
+                    UInt(0));
+                var pointer = _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _privateUintPointer,
+                    _vectorRegisters,
+                    safeIndex);
+                var write = _execKnownFull
+                    ? inRange
+                    : _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, Load(_boolType, _exec), inRange);
+                var current = Load(_uintType, pointer);
+                var next = _module.AddInstruction(SpirvOp.Select, _uintType, write, value, current);
+                if (_executingWave != 0) next = GuardCooperativeUint(next, current);
+                Store(pointer, next);
+                return;
+            }
+
             // With EXEC known to be all ones the write needs no EXEC test.
             var exec = _execKnownFull ? 0 : Load(_boolType, _exec);
             for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
