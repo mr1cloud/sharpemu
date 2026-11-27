@@ -163,6 +163,8 @@ public sealed partial class SpirvModuleBuilder
 
     public void DeclareLoopHeader(uint label) => _loopHeaders.Add(label);
 
+    public void MarkImmutableVariable(uint variable) => _immutableVariables.Add(variable);
+
     public uint AddInstruction(SpirvOp opcode, uint resultType, params uint[] operands)
     {
         if (opcode == SpirvOp.Load)
@@ -1479,73 +1481,6 @@ public sealed partial class SpirvModuleBuilder
         return IsValueOperation(opcode, []);
     }
 
-    // The passes over every function word index ids in arrays (every id is below _nextId); a word at or past it is a
-    // literal that names no variable, chain or definition.
-    private HashSet<uint> FindUnreadVariables(out HashSet<uint> unreadPointers)
-    {
-        var words = _functions;
-        var local = new bool[_nextId];
-        foreach (var variable in _localVariables)
-        {
-            local[variable] = true;
-        }
-
-        // The variable of each access chain into a local variable, once the scan has passed the chain (0: none).
-        var chainBases = new uint[_nextId];
-        var chains = new List<uint>();
-        var read = new bool[_nextId];
-        for (var offset = 0; offset < words.Count; offset += (int)(words[offset] >> 16))
-        {
-            var wordCount = (int)(words[offset] >> 16);
-            var opcode = (SpirvOp)(words[offset] & 0xFFFF);
-            var first = 1;
-            switch (opcode)
-            {
-                case SpirvOp.Variable:
-                    continue;
-                case SpirvOp.Store when wordCount == 3:
-                    first = 2;
-                    break;
-                case SpirvOp.AccessChain when wordCount >= 4 && words[offset + 3] < (uint)local.Length && local[words[offset + 3]]:
-                    chains.Add(words[offset + 2]);
-                    chainBases[words[offset + 2]] = words[offset + 3];
-                    first = 4;
-                    break;
-            }
-
-            for (var word = first; word < wordCount; word++)
-            {
-                if (opcode == SpirvOp.ExtInst && word == 4) continue;
-                var id = words[offset + word];
-                if (id >= (uint)local.Length)
-                {
-                    continue;
-                }
-
-                if (local[id])
-                {
-                    read[id] = true;
-                }
-                else if (chainBases[id] != 0)
-                {
-                    read[chainBases[id]] = true;
-                }
-            }
-        }
-
-        var unread = KeepsUnreadVariables ? [] : new HashSet<uint>(_localVariables.Where(variable => !read[variable]));
-        unreadPointers = new HashSet<uint>(unread);
-        foreach (var chain in chains)
-        {
-            if (unread.Contains(chainBases[chain]))
-            {
-                unreadPointers.Add(chain);
-            }
-        }
-
-        return unread;
-    }
-
     private static List<uint> WithoutVariables(List<uint> section, HashSet<uint> variables)
     {
         if (variables.Count == 0)
@@ -1607,120 +1542,6 @@ public sealed partial class SpirvModuleBuilder
 
     private static bool HasZeroByte(uint word) =>
         (word & 0xFF) == 0 || (word & 0xFF00) == 0 || (word & 0xFF0000) == 0 || (word & 0xFF000000) == 0;
-
-    private List<uint> CompactFunctions(HashSet<uint> removedIds, HashSet<uint> unreadPointers)
-    {
-        var words = _functions;
-        var starts = new List<int>();
-        for (var offset = 0; offset < words.Count; offset += (int)(words[offset] >> 16))
-        {
-            starts.Add(offset);
-        }
-
-        var removed = new bool[starts.Count];
-        var uses = new int[_nextId];
-        // The instruction (index + 1; 0: none) defining an id whose definition may be removed, and those ids in order.
-        var definers = new int[_nextId];
-        var defined = new List<uint>();
-        for (var index = 0; index < starts.Count; index++)
-        {
-            var offset = starts[index];
-            var wordCount = (int)(words[offset] >> 16);
-            var opcode = (SpirvOp)(words[offset] & 0xFFFF);
-            if (_removedInstructions.Contains(offset) ||
-                (opcode == SpirvOp.Store && unreadPointers.Contains(words[offset + 1])) ||
-                (opcode == SpirvOp.Variable && unreadPointers.Contains(words[offset + 2])))
-            {
-                removed[index] = true;
-                continue;
-            }
-
-            var first = 1;
-            if (IsRemovableDefinition(words, offset, wordCount))
-            {
-                definers[words[offset + 2]] = index + 1;
-                defined.Add(words[offset + 2]);
-                first = 3;
-            }
-
-            for (var word = first; word < wordCount; word++)
-            {
-                if (opcode == SpirvOp.ExtInst && word == 4) continue;
-                var id = words[offset + word];
-                if (id < (uint)uses.Length)
-                {
-                    uses[id]++;
-                }
-            }
-        }
-
-        var pending = new Stack<int>();
-        foreach (var id in defined)
-        {
-            if (uses[id] == 0)
-            {
-                pending.Push(definers[id] - 1);
-            }
-        }
-
-        while (pending.TryPop(out var index))
-        {
-            if (removed[index])
-            {
-                continue;
-            }
-
-            removed[index] = true;
-            var offset = starts[index];
-            var wordCount = (int)(words[offset] >> 16);
-            var opcode = (SpirvOp)(words[offset] & 0xFFFF);
-            removedIds.Add(words[offset + 2]);
-            for (var word = 3; word < wordCount; word++)
-            {
-                if (opcode == SpirvOp.ExtInst && word == 4) continue;
-                var id = words[offset + word];
-                if (id >= (uint)uses.Length || uses[id] == 0)
-                {
-                    continue;
-                }
-
-                if (--uses[id] == 0 && definers[id] != 0 && !removed[definers[id] - 1])
-                {
-                    pending.Push(definers[id] - 1);
-                }
-            }
-        }
-
-        var compacted = new List<uint>(words.Count);
-        List<uint>? prologue = null;
-        for (var index = 0; index < starts.Count; index++)
-        {
-            if (removed[index])
-            {
-                continue;
-            }
-
-            var offset = starts[index];
-            var wordCount = (int)(words[offset] >> 16);
-            if (prologue is not null && (SpirvOp)(words[offset] & 0xFFFF) != SpirvOp.Variable)
-            {
-                compacted.AddRange(prologue);
-                prologue = null;
-            }
-
-            for (var word = 0; word < wordCount; word++)
-            {
-                compacted.Add(words[offset + word]);
-            }
-
-            if (_entryPrologues.TryGetValue(offset, out var entry))
-            {
-                prologue = entry;
-            }
-        }
-
-        return compacted;
-    }
 
     private static List<uint> WithoutTargets(List<uint> section, HashSet<uint> removedIds)
     {

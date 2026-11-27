@@ -438,10 +438,15 @@ public sealed partial class SpirvModuleBuilder
         uint> _imageTypes = [];
     private readonly Dictionary<uint, uint> _sampledImageTypes = [];
     private readonly Dictionary<(SpirvStorageClass Storage, uint Type), uint> _pointerTypes = [];
+    private readonly Dictionary<uint, uint> _pointerElementTypes = [];
+    private readonly Dictionary<uint, uint> _variableTypes = [];
+    private readonly Dictionary<uint, uint> _variableInitializers = [];
+    private readonly HashSet<uint> _privateVariables = [];
     private readonly Dictionary<(uint Element, uint Count), uint> _arrayTypes = [];
     private readonly Dictionary<uint, uint> _runtimeArrayTypes = [];
     private readonly Dictionary<string, uint> _functionTypes = [];
     private readonly Dictionary<(uint Type, ulong Value), uint> _constants = [];
+    private readonly Dictionary<uint, uint> _nullConstants = [];
     // The value of every 32-bit integer and boolean constant, for folding instructions over them.
     private readonly Dictionary<uint, uint> _scalarConstantValues = [];
     private readonly HashSet<SpirvCapability> _declaredCapabilities = [];
@@ -744,6 +749,7 @@ public sealed partial class SpirvModuleBuilder
         var id = AllocateId();
         Emit(_typesConstantsGlobals, SpirvOp.TypePointer, id, (uint)storageClass, type);
         _pointerTypes.Add(key, id);
+        _pointerElementTypes[id] = type;
         if (IntegerWidth(type) != 0 || _floatTypes.ContainsValue(type) || _boolType == type)
         {
             _scalarPointerTypes.Add(id);
@@ -858,15 +864,14 @@ public sealed partial class SpirvModuleBuilder
 
     public uint ConstantNull(uint type)
     {
-        var key = (type, ulong.MaxValue);
-        if (_constants.TryGetValue(key, out var existing))
+        if (_nullConstants.TryGetValue(type, out var existing))
         {
             return existing;
         }
 
         var id = AllocateId();
         Emit(_typesConstantsGlobals, SpirvOp.ConstantNull, type, id);
-        _constants.Add(key, id);
+        _nullConstants.Add(type, id);
         NoteResultType(id, type);
         return id;
     }
@@ -902,9 +907,20 @@ public sealed partial class SpirvModuleBuilder
             Emit(_typesConstantsGlobals, SpirvOp.Variable, pointerType, id, (uint)storageClass);
         }
 
+        if (_pointerElementTypes.TryGetValue(pointerType, out var elementType))
+        {
+            _variableTypes[id] = elementType;
+        }
+
+        if (initializer.HasValue)
+        {
+            _variableInitializers[id] = initializer.Value;
+        }
+
         if (storageClass == SpirvStorageClass.Private)
         {
             _localVariables.Add(id);
+            _privateVariables.Add(id);
         }
         else if (storageClass == SpirvStorageClass.Input)
         {
@@ -978,6 +994,16 @@ public sealed partial class SpirvModuleBuilder
                 pointerType,
                 id,
                 (uint)SpirvStorageClass.Function);
+        }
+
+        if (_pointerElementTypes.TryGetValue(pointerType, out var elementType))
+        {
+            _variableTypes[id] = elementType;
+        }
+
+        if (initializer.HasValue)
+        {
+            _variableInitializers[id] = initializer.Value;
         }
 
         _localVariables.Add(id);
@@ -1163,9 +1189,11 @@ public sealed partial class SpirvModuleBuilder
             SetLogicalGlsl450MemoryModel();
         }
 
-        var unreadVariables = FindUnreadVariables(out var unreadPointers);
-        var removedIds = new HashSet<uint>(unreadVariables);
-        var functions = CompactFunctions(removedIds, unreadPointers);
+        var removedIds = new HashSet<uint>();
+        var removedVariables = new HashSet<uint>();
+        var functions = MaterializeFunctions();
+        functions = PromoteLocalVariables(functions, removedIds, removedVariables);
+        functions = EliminateDeadCodeAndUnreadVariables(functions, removedIds, removedVariables);
         var debug = WithoutTargets(_debug, removedIds);
         var annotations = WithoutTargets(_annotations, removedIds);
         if (KeepsFloatRounding)
@@ -1173,8 +1201,8 @@ public sealed partial class SpirvModuleBuilder
             annotations = WithNoContraction(functions, annotations);
         }
 
-        var entryPoints = WithoutInterfaces(_entryPoints, unreadVariables);
-        var globals = WithoutVariables(_typesConstantsGlobals, unreadVariables);
+        var entryPoints = WithoutInterfaces(_entryPoints, removedVariables);
+        var globals = WithoutVariables(_typesConstantsGlobals, removedVariables);
         var wordCount =
             5 +
             _capabilities.Count +
