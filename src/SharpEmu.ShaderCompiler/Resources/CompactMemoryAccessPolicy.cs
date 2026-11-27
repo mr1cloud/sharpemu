@@ -65,8 +65,25 @@ public static class CompactMemoryAccessPolicy
                 continue;
             }
 
-            if (memory.DeviceDescriptor ||
-                memory.Kind is MemoryResourceKind.Global or MemoryResourceKind.Flat or MemoryResourceKind.ScalarAddress)
+            if (memory.DeviceDescriptor)
+            {
+                var dwords = (int)Math.Max(1u, memory.DataDwords);
+                if (memory.Formatted || memory.Typed)
+                {
+                    // Non-compact formatted device loads issue two page-table lookups per component plus inline
+                    // format decoding (~80 blocks per xyzw load); formatted device stores expand across format
+                    // shapes with masked atomic CAS loops.
+                    count += memory.Access == MemoryAccess.Read ? dwords * 4 : Math.Max(32, dwords * 8);
+                }
+                else
+                {
+                    count += dwords;
+                }
+            }
+            else if (memory.Kind is MemoryResourceKind.Global or MemoryResourceKind.Flat or MemoryResourceKind.ScalarAddress ||
+                (memory.Kind == MemoryResourceKind.ScalarBuffer && memory.Resource == MemoryAccessInfo.NoResource) ||
+                (memory.Kind == MemoryResourceKind.Buffer &&
+                 memory.BufferDescriptor?.ChooseStrategy(memory.Typed, memory.Formatted, memory.Access == MemoryAccess.Atomic) == BufferLoweringStrategy.PhysicalStorageBuffer))
             {
                 count += (int)Math.Max(1u, memory.DataDwords);
             }
