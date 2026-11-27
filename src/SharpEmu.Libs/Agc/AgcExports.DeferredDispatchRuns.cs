@@ -559,6 +559,11 @@ public static partial class AgcExports
                         }
                     }
 
+                    if (item.Record is { } record && ExecutorSink.ShouldPrestartComputePipeline(record))
+                    {
+                        _owner._pipelines!.TryCreateComputePipeline(record.Program.Input, record.Program.Program, out _);
+                    }
+
                     item.Done.Set();
                     Volatile.Write(ref _cursor, _cursor + 1);
                 }
