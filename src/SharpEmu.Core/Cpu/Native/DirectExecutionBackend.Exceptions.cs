@@ -1512,7 +1512,7 @@ public sealed partial class DirectExecutionBackend
 
 		if (requireWritable && !OperatingSystem.IsWindows())
 		{
-			return true;
+			return IsWritablePosixHostRange(address, length);
 		}
 
 		var end = address + length;
@@ -1540,6 +1540,62 @@ public sealed partial class DirectExecutionBackend
 			if (regionEnd < mbi.BaseAddress || regionEnd <= cursor)
 			{
 				return false;
+			}
+
+			cursor = Math.Min(regionEnd, end);
+		}
+
+		return true;
+	}
+
+	private unsafe static bool IsWritablePosixHostRange(ulong address, ulong length)
+	{
+		var end = address + length;
+		var cursor = address;
+		while (cursor < end)
+		{
+			if (VirtualQuery(
+					(void*)cursor,
+					out var mbi,
+					(nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			{
+				return false;
+			}
+
+			var regionEnd = mbi.BaseAddress + mbi.RegionSize;
+			if (regionEnd < mbi.BaseAddress || regionEnd <= cursor)
+			{
+				return false;
+			}
+
+			if (mbi.State == MEM_COMMIT)
+			{
+				if (!IsWritableProtection(mbi.Protect))
+				{
+					return false;
+				}
+			}
+			else if (mbi.State == HostMemory.MEM_RESERVE)
+			{
+				return false;
+			}
+			else if (OperatingSystem.IsLinux())
+			{
+				// HostMemory on POSIX only tracks emulator-managed regions; untracked
+				// host memory (such as pthread stacks) reports MEM_FREE. Probe via
+				// process_vm_readv so unmapped or PROT_NONE addresses still fail instead
+				// of raising a nested SIGSEGV inside the SIGILL handler.
+				byte probe = 0;
+				if (!TryReadLinuxMemory(cursor, &probe, 1))
+				{
+					return false;
+				}
+
+				var pageEnd = (cursor & ~0xFFFUL) + 0x1000UL;
+				if (pageEnd > cursor && pageEnd < regionEnd)
+				{
+					regionEnd = pageEnd;
+				}
 			}
 
 			cursor = Math.Min(regionEnd, end);
@@ -1654,8 +1710,15 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
-		ulong accessType = *exceptionRecord->ExceptionInformation;
-		ulong faultAddress = exceptionRecord->ExceptionInformation[1];
+		return TryHandleLazyCommittedPage(
+			*exceptionRecord->ExceptionInformation,
+			exceptionRecord->ExceptionInformation[1],
+			rip,
+			rsp);
+	}
+
+	private unsafe bool TryHandleLazyCommittedPage(ulong accessType, ulong faultAddress, ulong rip, ulong rsp)
+	{
 		if (accessType == 8 && faultAddress < 4294967296L)
 		{
 			return false;
@@ -1664,7 +1727,8 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
-		if (!IsGuestOwnedLazyCommitAddress(faultAddress, out var owner))
+		if (_lazyCommitRangeGate is null || _prtLazyCommitRanges is null ||
+			!IsGuestOwnedLazyCommitAddress(faultAddress, out var owner))
 		{
 			return false;
 		}
