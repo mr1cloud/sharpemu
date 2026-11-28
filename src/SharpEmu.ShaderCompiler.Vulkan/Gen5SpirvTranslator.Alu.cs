@@ -1968,7 +1968,7 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
-                value = LoadVDynamic(IAdd(UInt(source.Value), sourceOffset));
+                value = LoadVDynamic(IAdd(UInt(source.Value), sourceOffset), source.Value);
             }
 
             if (instruction.Opcode == "VMovrelsB32")
