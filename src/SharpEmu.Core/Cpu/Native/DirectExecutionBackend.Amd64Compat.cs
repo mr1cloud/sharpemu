@@ -7,6 +7,8 @@ using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using Iced.Intel;
 using SharpEmu.Core.Cpu.Emulation;
+using SharpEmu.HLE;
+using SharpEmu.HLE.GpuMemory;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -390,7 +392,7 @@ public sealed partial class DirectExecutionBackend
             : rawAddress;
         var cacheLineAddress = address & ~63UL;
 
-        if (!IsWritableHostRange(cacheLineAddress, 64))
+        if (!TryEnsureClzeroTargetWritable(contextRecord, rip, cacheLineAddress))
         {
             return false;
         }
@@ -407,6 +409,54 @@ public sealed partial class DirectExecutionBackend
         }
 
         return true;
+    }
+
+    private unsafe bool TryEnsureClzeroTargetWritable(void* contextRecord, ulong rip, ulong cacheLineAddress)
+    {
+        if (!IsCanonicalUserAddress(cacheLineAddress) ||
+            cacheLineAddress > 0x0000_8000_0000_0000UL - 64)
+        {
+            return false;
+        }
+
+        // On POSIX, GuestImageWriteTracker arms PROT_READ directly via mprotect without updating
+        // HostMemory's shadow region table, so resolve any armed image write watch before relying
+        // on IsWritableHostRange.
+        if (!OperatingSystem.IsWindows())
+        {
+            _ = GuestImageWriteTracker.TryHandleWriteFault(cacheLineAddress);
+        }
+
+        if (IsWritableHostRange(cacheLineAddress, 64))
+        {
+            return true;
+        }
+
+        // Emulate the write-fault resolution chain that a hardware CLZERO store would trigger:
+        // image write tracking, lazy page commit, and GPU page-guard invalidation. A page can
+        // require multiple steps (e.g. lazy commit followed by GPU watch release), so re-check
+        // host writability after each step and continue if the page is still not writable.
+        if (OperatingSystem.IsWindows() &&
+            GuestImageWriteTracker.TryHandleWriteFault(cacheLineAddress) &&
+            IsWritableHostRange(cacheLineAddress, 64))
+        {
+            return true;
+        }
+
+        var rsp = ReadCtxU64(contextRecord, CTX_RSP);
+        if (TryHandleLazyCommittedPage(1uL, cacheLineAddress, rip, rsp) &&
+            IsWritableHostRange(cacheLineAddress, 64))
+        {
+            return true;
+        }
+
+        if (GuestGpuMemoryHook.TryResolveFault(FaultKind.Write, cacheLineAddress) &&
+            IsWritableHostRange(cacheLineAddress, 64))
+        {
+            return true;
+        }
+
+        return IsWritableHostRange(cacheLineAddress, 64);
     }
 
     private unsafe bool TryRecoverMonitorxMwaitx(void* contextRecord, ulong rip)
