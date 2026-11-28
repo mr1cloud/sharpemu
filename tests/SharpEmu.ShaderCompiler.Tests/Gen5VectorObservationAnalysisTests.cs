@@ -110,11 +110,17 @@ public sealed class Gen5VectorObservationAnalysisTests
     }
 
     [Fact]
-    public void ARelativeMoveDisablesThePlan()
+    public void AnUnboundedRelativeSourceMoveConservativelyObservesPriorWrites()
     {
+        SaveExec();
+        Narrow();
+        var write = Add(Vop2(0, "VAddU32", 4, Operand(1), Gen5Operand.Vector(2)));
+        RestoreExec();
         Add(Vop1(0, "VMovrelsB32", 3, Gen5Operand.Vector(4)));
         Add(EndProgram(0));
 
-        Assert.Null(Gen5VectorObservationAnalysis.Analyze(Program([.. _instructions]), wave32: false));
+        var plan = Gen5VectorObservationAnalysis.Analyze(Program([.. _instructions]), wave32: false);
+        Assert.NotNull(plan);
+        Assert.False(plan.UnobservedWrites(write).Contains(4));
     }
 }
