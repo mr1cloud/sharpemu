@@ -157,6 +157,9 @@ public sealed partial class ScalarValueGraph
         private RegisterState CopyState(RegisterState source) =>
             _spareStates.TryPop(out var state) ? state.CopyFrom(source) : source.Clone();
 
+        private RegisterState CopyMergedState(RegisterState source) =>
+            _spareStates.TryPop(out var state) ? state.CopyFromFiltered(source) : source.CloneFiltered();
+
         // Reverse postorder completes acyclic predecessors before their joins.
         // Loop back edges still use the convergence check in the worklist.
         private int[] BuildBlockProcessingPriorities()
@@ -211,6 +214,8 @@ public sealed partial class ScalarValueGraph
             return state;
         }
 
+        private readonly List<(int Block, RegisterState State)> _visited = [];
+
         private RegisterState MergePredecessors(int block)
         {
             var predecessors = _graph.ControlFlow.Predecessors[block];
@@ -219,10 +224,18 @@ public sealed partial class ScalarValueGraph
                 return InitialState();
             }
 
-            var visited = new List<(int Block, RegisterState State)>();
-            var pending = false;
-            foreach (var predecessor in predecessors)
+            // Fast path: non-entry block with a single already-visited predecessor.
+            if (block != 0 && predecessors.Count == 1 && _exit[predecessors[0]] is { } singleExit)
             {
+                return CopyMergedState(singleExit);
+            }
+
+            var visited = _visited;
+            visited.Clear();
+            var pending = false;
+            for (var index = 0; index < predecessors.Count; index++)
+            {
+                var predecessor = predecessors[index];
                 if (_exit[predecessor] is { } exit)
                 {
                     visited.Add((predecessor, exit));
@@ -240,7 +253,8 @@ public sealed partial class ScalarValueGraph
                 visited.Insert(0, (-1, InitialState()));
             }
 
-            if (visited.Count == 0)
+            var visitedCount = visited.Count;
+            if (visitedCount == 0)
             {
                 return merged;
             }
@@ -249,53 +263,168 @@ public sealed partial class ScalarValueGraph
             _phiSources = null;
             Array.Clear(_mergeUndefined);
 
+            var firstState = visited[0].State;
             for (var register = 0; register < ScalarRegisterCount; register++)
             {
-                merged.Scalars[register] = MergeSlot(block, register, visited, pending, static (state, slot) => state.Scalars[slot]);
+                var first = firstState.Scalars[register];
+                if (first.IsUndefined)
+                {
+                    merged.Scalars[register] = _mergeUndefined[(int)first.Type] ??= _graph.Undefined(first.Type);
+                    continue;
+                }
+
+                var same = true;
+                var anyUndefined = false;
+                for (var index = 1; index < visitedCount; index++)
+                {
+                    var value = visited[index].State.Scalars[register];
+                    if (value.IsUndefined)
+                    {
+                        anyUndefined = true;
+                        break;
+                    }
+
+                    same &= ReferenceEquals(value, first);
+                }
+
+                if (anyUndefined)
+                {
+                    merged.Scalars[register] = _mergeUndefined[(int)first.Type] ??= _graph.Undefined(first.Type);
+                }
+                else if (same && !pending)
+                {
+                    merged.Scalars[register] = first;
+                }
+                else
+                {
+                    merged.Scalars[register] = MergeDifferingSlot(block, register, first.Type, visited,
+                        static (state, slot) => state.Scalars[slot]);
+                }
             }
 
             for (var register = 0; register < VectorRegisterCount; register++)
             {
-                merged.Vectors[register] = MergeSlot(block, ScalarRegisterCount + register, visited, pending,
-                    static (state, slot) => state.Vectors[slot - ScalarRegisterCount]);
+                var first = firstState.Vectors[register];
+                if (first.IsUndefined)
+                {
+                    merged.Vectors[register] = _mergeUndefined[(int)first.Type] ??= _graph.Undefined(first.Type);
+                    continue;
+                }
+
+                var same = true;
+                var anyUndefined = false;
+                for (var index = 1; index < visitedCount; index++)
+                {
+                    var value = visited[index].State.Vectors[register];
+                    if (value.IsUndefined)
+                    {
+                        anyUndefined = true;
+                        break;
+                    }
+
+                    same &= ReferenceEquals(value, first);
+                }
+
+                if (anyUndefined)
+                {
+                    merged.Vectors[register] = _mergeUndefined[(int)first.Type] ??= _graph.Undefined(first.Type);
+                }
+                else if (same && !pending)
+                {
+                    merged.Vectors[register] = first;
+                }
+                else
+                {
+                    merged.Vectors[register] = MergeDifferingSlot(block, ScalarRegisterCount + register, first.Type, visited,
+                        static (state, slot) => state.Vectors[slot - ScalarRegisterCount]);
+                }
             }
 
             merged.Exec = MergeSlot(block, RegisterState.ExecSlot, visited, pending, static (state, _) => state.Exec);
             merged.Vcc = MergeSlot(block, RegisterState.VccSlot, visited, pending, static (state, _) => state.Vcc);
             merged.Scc = MergeSlot(block, RegisterState.SccSlot, visited, pending, static (state, _) => state.Scc);
 
-            var laneKeys = new HashSet<(uint Register, uint Lane)>(visited[0].State.Lanes.Keys);
-            foreach (var (_, state) in visited.Skip(1))
+            var smallestLaneIndex = 0;
+            var smallestLaneCount = firstState.Lanes.Count;
+            for (var index = 1; index < visitedCount && smallestLaneCount != 0; index++)
             {
-                laneKeys.IntersectWith(state.Lanes.Keys);
-            }
-
-            foreach (var key in laneKeys)
-            {
-                var value = MergeSlot(block, RegisterState.LaneSlot(key.Register, key.Lane), visited, pending,
-                    static (state, slot) => state.Lanes[RegisterState.LaneOfSlot(slot)]);
-                if (!value.IsUndefined)
+                var count = visited[index].State.Lanes.Count;
+                if (count < smallestLaneCount)
                 {
-                    merged.Lanes[key] = value;
+                    smallestLaneCount = count;
+                    smallestLaneIndex = index;
                 }
             }
 
-            var maskKeys = new HashSet<uint>(visited[0].State.ThreadBits.Keys);
-            foreach (var (_, state) in visited.Skip(1))
+            if (smallestLaneCount != 0)
             {
-                maskKeys.IntersectWith(state.ThreadBits.Keys);
-            }
-
-            foreach (var key in maskKeys)
-            {
-                var value = MergeSlot(block, RegisterState.MaskSlot(key), visited, pending,
-                    static (state, slot) => state.ThreadBits[RegisterState.MaskOfSlot(slot)]);
-                if (!value.IsUndefined)
+                foreach (var key in visited[smallestLaneIndex].State.Lanes.Keys)
                 {
-                    merged.ThreadBits[key] = value;
+                    var inAll = true;
+                    for (var index = 0; index < visitedCount; index++)
+                    {
+                        if (index != smallestLaneIndex && !visited[index].State.Lanes.ContainsKey(key))
+                        {
+                            inAll = false;
+                            break;
+                        }
+                    }
+
+                    if (!inAll)
+                    {
+                        continue;
+                    }
+
+                    var value = MergeSlot(block, RegisterState.LaneSlot(key.Register, key.Lane), visited, pending,
+                        static (state, slot) => state.Lanes[RegisterState.LaneOfSlot(slot)]);
+                    if (!value.IsUndefined)
+                    {
+                        merged.Lanes[key] = value;
+                    }
                 }
             }
 
+            var smallestMaskIndex = 0;
+            var smallestMaskCount = firstState.ThreadBits.Count;
+            for (var index = 1; index < visitedCount && smallestMaskCount != 0; index++)
+            {
+                var count = visited[index].State.ThreadBits.Count;
+                if (count < smallestMaskCount)
+                {
+                    smallestMaskCount = count;
+                    smallestMaskIndex = index;
+                }
+            }
+
+            if (smallestMaskCount != 0)
+            {
+                foreach (var key in visited[smallestMaskIndex].State.ThreadBits.Keys)
+                {
+                    var inAll = true;
+                    for (var index = 0; index < visitedCount; index++)
+                    {
+                        if (index != smallestMaskIndex && !visited[index].State.ThreadBits.ContainsKey(key))
+                        {
+                            inAll = false;
+                            break;
+                        }
+                    }
+
+                    if (!inAll)
+                    {
+                        continue;
+                    }
+
+                    var value = MergeSlot(block, RegisterState.MaskSlot(key), visited, pending,
+                        static (state, slot) => state.ThreadBits[RegisterState.MaskOfSlot(slot)]);
+                    if (!value.IsUndefined)
+                    {
+                        merged.ThreadBits[key] = value;
+                    }
+                }
+            }
+
+            visited.Clear();
             return merged;
         }
 
@@ -303,13 +432,13 @@ public sealed partial class ScalarValueGraph
         // a value merged there is a select on the branch condition rather than an opaque phi.
         // Shaders pick descriptors this way (a sampler reloaded when a constant-buffer flag is
         // set); as a select the host can still evaluate it per draw.
-        private (ScalarValue Taken, int TakenPredecessor)? _uniformJoin;
+        private (ScalarValue Taken, RegisterState TakenState, RegisterState OtherState)? _uniformJoin;
 
-        private (ScalarValue Taken, int TakenPredecessor)? FindUniformJoin(int block, List<(int Block, RegisterState State)> visited)
+        private (ScalarValue Taken, RegisterState TakenState, RegisterState OtherState)? FindUniformJoin(int block, List<(int Block, RegisterState State)> visited)
         {
             var controlFlow = _graph.ControlFlow;
             var predecessors = controlFlow.Predecessors[block];
-            if (visited.Count != 2 || predecessors.Count != 2 || visited.Any(entry => entry.Block < 0) ||
+            if (visited.Count != 2 || predecessors.Count != 2 || visited[0].Block < 0 || visited[1].Block < 0 ||
                 controlFlow.LoopHeaders.Contains(block))
             {
                 return null;
@@ -362,7 +491,27 @@ public sealed partial class ScalarValueGraph
                 : Unary(ScalarOperation.LogicalNot, branchExit.Scc);
             // A constant condition only comes from the modelled initial SCC, which the hardware
             // leaves undefined; keep that join an opaque phi.
-            return taken.IsUndefined || taken.IsConstant ? null : (taken, takenPredecessor);
+            if (taken.IsUndefined || taken.IsConstant)
+            {
+                return null;
+            }
+
+            RegisterState? takenState = null;
+            RegisterState? otherState = null;
+            for (var index = 0; index < visited.Count; index++)
+            {
+                var (predecessor, state) = visited[index];
+                if (predecessor == takenPredecessor)
+                {
+                    takenState ??= state;
+                }
+                else
+                {
+                    otherState ??= state;
+                }
+            }
+
+            return takenState is not null && otherState is not null ? (taken, takenState, otherState) : null;
         }
 
         // A block's instructions are in program order, so its terminator is the last one. Scanning the whole program for
@@ -393,10 +542,15 @@ public sealed partial class ScalarValueGraph
             Func<RegisterState, int, ScalarValue> read)
         {
             var first = read(visited[0].State, slot);
-            var same = true;
-            foreach (var (_, state) in visited)
+            if (first.IsUndefined)
             {
-                var value = read(state, slot);
+                return _mergeUndefined[(int)first.Type] ??= _graph.Undefined(first.Type);
+            }
+
+            var same = true;
+            for (var index = 1; index < visited.Count; index++)
+            {
+                var value = read(visited[index].State, slot);
                 if (value.IsUndefined)
                 {
                     return _mergeUndefined[(int)first.Type] ??= _graph.Undefined(first.Type);
@@ -410,14 +564,24 @@ public sealed partial class ScalarValueGraph
                 return first;
             }
 
+            return MergeDifferingSlot(block, slot, first.Type, visited, read);
+        }
+
+        private ScalarValue MergeDifferingSlot(
+            int block,
+            int slot,
+            ScalarValueType type,
+            List<(int Block, RegisterState State)> visited,
+            Func<RegisterState, int, ScalarValue> read)
+        {
             if (_uniformJoin is { } join)
             {
-                return UniformJoinSelect(join, visited, slot, read);
+                return UniformJoinSelect(join, slot, read);
             }
 
             if (!_phis.TryGetValue((block, slot), out var phi))
             {
-                phi = _graph.Phi(block, first.Type);
+                phi = _graph.Phi(block, type);
                 _phis[(block, slot)] = phi;
             }
 
@@ -432,13 +596,11 @@ public sealed partial class ScalarValueGraph
             return phi;
         }
 
-        // Its own method: the lambdas capture the join, and a capture in MergeSlot allocated a closure on every slot of
-        // every merge, half of what a large graph allocated.
-        private ScalarValue UniformJoinSelect((ScalarValue Taken, int TakenPredecessor) join,
-            List<(int Block, RegisterState State)> visited, int slot, Func<RegisterState, int, ScalarValue> read)
+        private ScalarValue UniformJoinSelect((ScalarValue Taken, RegisterState TakenState, RegisterState OtherState) join,
+            int slot, Func<RegisterState, int, ScalarValue> read)
         {
-            var taken = read(visited.First(entry => entry.Block == join.TakenPredecessor).State, slot);
-            var other = read(visited.First(entry => entry.Block != join.TakenPredecessor).State, slot);
+            var taken = read(join.TakenState, slot);
+            var other = read(join.OtherState, slot);
             return _graph.Select(join.Taken, taken, other);
         }
 
@@ -450,17 +612,54 @@ public sealed partial class ScalarValueGraph
         private (int[] Order, RegisterState?[] Sources) PhiSources(int block, List<(int Block, RegisterState State)> visited)
         {
             var predecessors = _graph.ControlFlow.Predecessors[block];
-            var order = block == 0 ? new[] { -1 }.Concat(predecessors).ToArray() : predecessors.ToArray();
-            var states = new Dictionary<int, RegisterState>(visited.Count);
-            foreach (var (predecessor, state) in visited)
+            int[] order;
+            if (block == 0)
             {
-                states.TryAdd(predecessor, state);
+                order = new int[predecessors.Count + 1];
+                order[0] = -1;
+                for (var index = 0; index < predecessors.Count; index++)
+                {
+                    order[index + 1] = predecessors[index];
+                }
+            }
+            else
+            {
+                order = new int[predecessors.Count];
+                for (var index = 0; index < predecessors.Count; index++)
+                {
+                    order[index] = predecessors[index];
+                }
             }
 
             var sources = new RegisterState?[order.Length];
-            for (var index = 0; index < order.Length; index++)
+            if (order.Length <= 4)
             {
-                sources[index] = states.GetValueOrDefault(order[index]);
+                for (var index = 0; index < order.Length; index++)
+                {
+                    var target = order[index];
+                    for (var visitedIndex = 0; visitedIndex < visited.Count; visitedIndex++)
+                    {
+                        if (visited[visitedIndex].Block == target)
+                        {
+                            sources[index] = visited[visitedIndex].State;
+                            break;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var states = new Dictionary<int, RegisterState>(visited.Count);
+                for (var index = 0; index < visited.Count; index++)
+                {
+                    var (predecessor, state) = visited[index];
+                    states.TryAdd(predecessor, state);
+                }
+
+                for (var index = 0; index < order.Length; index++)
+                {
+                    sources[index] = states.GetValueOrDefault(order[index]);
+                }
             }
 
             return (order, sources);
@@ -1317,8 +1516,12 @@ public sealed partial class ScalarValueGraph
                 instruction.Control is Gen5DppControl or Gen5Dpp8Control or Gen5Vop3pControl;
             var value = hasModifiers ? _graph.Undefined(ScalarValueType.U32) : VectorResult(instruction, state);
             if (_recording && opcode == "VMed3U32" && !hasModifiers && instruction.Sources.Count == 3)
-                _graph.UnsignedMedianSources[instruction.Pc] = instruction.Sources
-                    .Select(source => ReadVectorOperand(source, state)).ToArray();
+                _graph.UnsignedMedianSources[instruction.Pc] =
+                [
+                    ReadVectorOperand(instruction.Sources[0], state),
+                    ReadVectorOperand(instruction.Sources[1], state),
+                    ReadVectorOperand(instruction.Sources[2], state),
+                ];
             if (instruction.Control is Gen5Vop3Control { ScalarDestination: { } carryDestination } && !hasModifiers &&
                 opcode is "VAddCoU32" or "VSubCoU32" or "VSubrevCoU32" or "VAddCoCiU32" or "VSubCoCiU32" or "VSubrevCoCiU32" or "VMadU64U32")
             {
@@ -1783,9 +1986,15 @@ public sealed partial class ScalarValueGraph
                         null,
                         null),
                     Gen5ImageControl image => new MemoryAccessBinding(
-                        _graph.Handle(ScalarValueKind.ImageHandle, Enumerable.Range(0, 8).Select(index => state.Read(image.ScalarResource + (uint)index)).ToArray()),
+                        _graph.Handle(ScalarValueKind.ImageHandle,
+                            state.Read(image.ScalarResource), state.Read(image.ScalarResource + 1),
+                            state.Read(image.ScalarResource + 2), state.Read(image.ScalarResource + 3),
+                            state.Read(image.ScalarResource + 4), state.Read(image.ScalarResource + 5),
+                            state.Read(image.ScalarResource + 6), state.Read(image.ScalarResource + 7)),
                         _graph.Memory[memoryIndex].NeedsSampler
-                            ? _graph.Handle(ScalarValueKind.SamplerHandle, Enumerable.Range(0, 4).Select(index => state.Read(image.ScalarSampler + (uint)index)).ToArray())
+                            ? _graph.Handle(ScalarValueKind.SamplerHandle,
+                                state.Read(image.ScalarSampler), state.Read(image.ScalarSampler + 1),
+                                state.Read(image.ScalarSampler + 2), state.Read(image.ScalarSampler + 3))
                             : null,
                         null),
                     Gen5GlobalMemoryControl global => new MemoryAccessBinding(
@@ -2073,22 +2282,57 @@ public sealed partial class ScalarValueGraph
             }
         }
 
-        public RegisterState Clone() => new RegisterState(_graph).CopyFrom(this);
+        private RegisterState(ScalarValueGraph graph, RegisterState source, bool filterUndefined)
+        {
+            _graph = graph;
+            Scalars = new ScalarValue[ScalarRegisterCount];
+            Vectors = new ScalarValue[VectorRegisterCount];
+            CopyFromCore(source, filterUndefined);
+        }
 
-        public RegisterState CopyFrom(RegisterState source)
+        public RegisterState Clone() => new(_graph, this, filterUndefined: false);
+
+        public RegisterState CloneFiltered() => new(_graph, this, filterUndefined: true);
+
+        public RegisterState CopyFrom(RegisterState source) => CopyFromCore(source, filterUndefined: false);
+
+        public RegisterState CopyFromFiltered(RegisterState source) => CopyFromCore(source, filterUndefined: true);
+
+        [System.Diagnostics.CodeAnalysis.MemberNotNull(nameof(Exec), nameof(Vcc), nameof(Scc), nameof(CarryOut))]
+        private RegisterState CopyFromCore(RegisterState source, bool filterUndefined)
         {
             Array.Copy(source.Scalars, Scalars, Scalars.Length);
             Array.Copy(source.Vectors, Vectors, Vectors.Length);
-            Lanes.Clear();
-            foreach (var (key, value) in source.Lanes)
+            if (Lanes.Count != 0)
             {
-                Lanes[key] = value;
+                Lanes.Clear();
             }
 
-            ThreadBits.Clear();
-            foreach (var (key, value) in source.ThreadBits)
+            if (source.Lanes.Count != 0)
             {
-                ThreadBits[key] = value;
+                foreach (var (key, value) in source.Lanes)
+                {
+                    if (!filterUndefined || !value.IsUndefined)
+                    {
+                        Lanes[key] = value;
+                    }
+                }
+            }
+
+            if (ThreadBits.Count != 0)
+            {
+                ThreadBits.Clear();
+            }
+
+            if (source.ThreadBits.Count != 0)
+            {
+                foreach (var (key, value) in source.ThreadBits)
+                {
+                    if (!filterUndefined || !value.IsUndefined)
+                    {
+                        ThreadBits[key] = value;
+                    }
+                }
             }
 
             Exec = source.Exec;
