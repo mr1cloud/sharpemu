@@ -7,6 +7,8 @@ namespace SharpEmu.ShaderCompiler.Ir;
 
 public readonly record struct VectorRegisterSet(UInt128 Low, UInt128 High)
 {
+    public static VectorRegisterSet All => new(UInt128.MaxValue, UInt128.MaxValue);
+
     public bool IsEmpty => Low == UInt128.Zero && High == UInt128.Zero;
 
     public bool Contains(uint register) =>
@@ -63,10 +65,11 @@ public static class Gen5VectorObservationAnalysis
             return null;
         }
 
+        IReadOnlyDictionary<uint, uint[]>? moveRelativeOffsets = null;
         var effects = new Effect[instructions.Count];
         for (var index = 0; index < instructions.Count; index++)
         {
-            if (!TryDescribe(instructions[index], out effects[index]))
+            if (!TryDescribe(program, instructions[index], ref moveRelativeOffsets, out effects[index]))
             {
                 return null;
             }
@@ -168,15 +171,23 @@ public static class Gen5VectorObservationAnalysis
         return (live, observed);
     }
 
-    private static bool TryDescribe(Gen5ShaderInstruction instruction, out Effect effect)
+    private static bool TryDescribe(
+        Gen5ShaderProgram program,
+        Gen5ShaderInstruction instruction,
+        ref IReadOnlyDictionary<uint, uint[]>? moveRelativeOffsets,
+        out Effect effect)
     {
         effect = default;
         var opcode = instruction.Opcode;
-        if (opcode.StartsWith("VMovrel", StringComparison.Ordinal) ||
-            opcode.Contains("Raw", StringComparison.Ordinal) ||
+        if (opcode.Contains("Raw", StringComparison.Ordinal) ||
             opcode is "SSetpcB64" or "SSwappcB64" or "SRfeB64" or "SCbranchJoin" or "SCbranchGFork" or "SCbranchIFork")
         {
             return false;
+        }
+
+        if (opcode.StartsWith("VMovrel", StringComparison.Ordinal))
+        {
+            return TryDescribeMoveRelative(program, instruction, ref moveRelativeOffsets, out effect);
         }
 
         var reads = default(VectorRegisterSet);
@@ -244,6 +255,87 @@ public static class Gen5VectorObservationAnalysis
                 }
 
                 break;
+        }
+
+        effect = new Effect(reads, cross, writes, full, DescribeExec(instruction));
+        return true;
+    }
+
+    private static bool TryDescribeMoveRelative(
+        Gen5ShaderProgram program,
+        Gen5ShaderInstruction instruction,
+        ref IReadOnlyDictionary<uint, uint[]>? moveRelativeOffsets,
+        out Effect effect)
+    {
+        effect = default;
+        var opcode = instruction.Opcode;
+        if (opcode is not ("VMovrelsB32" or "VMovreldB32" or "VMovrelsdB32" or "VMovrelsd2B32"))
+        {
+            return false;
+        }
+
+        var reads = default(VectorRegisterSet);
+        var cross = default(VectorRegisterSet);
+        var writes = default(VectorRegisterSet);
+        var full = default(VectorRegisterSet);
+
+        if (opcode == "VMovreldB32")
+        {
+            if (instruction.Sources.Count > 0 && instruction.Sources[0].Kind == Gen5OperandKind.VectorRegister)
+            {
+                reads = reads.With(instruction.Sources[0].Value);
+            }
+        }
+        else if (instruction.Sources.Count == 0)
+        {
+            reads = VectorRegisterSet.All;
+        }
+        else if (instruction.Sources[0].Kind == Gen5OperandKind.VectorRegister)
+        {
+            var baseRegister = instruction.Sources[0].Value;
+            if (opcode is "VMovrelsB32" or "VMovrelsdB32")
+            {
+                moveRelativeOffsets ??= Gen5MoveRelativeOffsets.Analyze(program);
+                if (moveRelativeOffsets.TryGetValue(instruction.Pc, out var offsets) && offsets.Length > 0)
+                {
+                    foreach (var offset in offsets)
+                    {
+                        reads = reads.With(unchecked(baseRegister + offset) & 511u);
+                    }
+                }
+                else
+                {
+                    reads = VectorRegisterSet.All;
+                }
+            }
+            else
+            {
+                reads = VectorRegisterSet.All;
+            }
+        }
+
+        if (instruction.Control is Gen5DppControl or Gen5Dpp8Control)
+        {
+            cross = reads;
+        }
+
+        if (opcode == "VMovrelsB32" &&
+            instruction.Destinations.Count > 0 &&
+            instruction.Destinations[0].Kind == Gen5OperandKind.VectorRegister)
+        {
+            var destination = instruction.Destinations[0].Value;
+            writes = writes.With(destination);
+            var partial =
+                instruction.Control is Gen5SdwaControl { DestinationSelect: not 6 } or Gen5SdwaControl { DestinationUnused: not 0 } ||
+                instruction.Control is Gen5Vop3Control { OperandSelect: not 0 };
+            if (partial)
+            {
+                reads = reads.With(destination);
+            }
+            else
+            {
+                full = full.With(destination);
+            }
         }
 
         effect = new Effect(reads, cross, writes, full, DescribeExec(instruction));
