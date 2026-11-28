@@ -173,10 +173,12 @@ public static partial class Gen5SpirvTranslator
         // register access of every invocation then spills through it.
         private readonly Dictionary<uint, uint> _scalarRegisterVariables = new();
         private const uint DynamicVectorSelectBudget = 1024;
+        private const ulong ReadOnlyDynamicVectorSelectBudgetCap = 4096;
         private readonly Dictionary<uint, uint> _vectorRegisterVariables = new();
         private uint _vectorRegisters;
         private uint _vectorRegisterArrayLength;
         private (uint First, uint Last) _dynamicVectorRange;
+        private bool[]? _possiblyNonzeroVectors;
         private uint _packedHalfRegisters;
         private uint _scc;
         private uint _vcc;
@@ -666,6 +668,12 @@ public static partial class Gen5SpirvTranslator
                 // sized Private array when unbounded V_MOVREL* select chains would explode SPIR-V
                 // size and driver compile time.
                 _dynamicVectorRange = DynamicVectorRange(_request.Program);
+                _possiblyNonzeroVectors = ComputePossiblyNonzeroVectors(out var highestPossiblyNonzero);
+                if (_possiblyNonzeroVectors is not null && highestPossiblyNonzero > _dynamicVectorRange.Last)
+                {
+                    _dynamicVectorRange = (Math.Min(_dynamicVectorRange.First, highestPossiblyNonzero), highestPossiblyNonzero);
+                }
+
                 if (ShouldUseDynamicVectorArray())
                 {
                     _vectorRegisterArrayLength = Math.Min(_dynamicVectorRange.Last + 16, VectorRegisterCount);
@@ -9721,32 +9729,276 @@ public static partial class Gen5SpirvTranslator
             return RegisterVariable(CurrentVectorRegisterVariables(), register, CurrentVectorRegisterPrefix());
         }
 
+        private bool[]? ComputePossiblyNonzeroVectors(out uint highestMarked)
+        {
+            highestMarked = 0;
+            var possiblyNonzero = new bool[VectorRegisterCount];
+            var maxMarked = 0u;
+
+            void Mark(uint register)
+            {
+                if (register < VectorRegisterCount)
+                {
+                    possiblyNonzero[register] = true;
+                    if (register > maxMarked)
+                    {
+                        maxMarked = register;
+                    }
+                }
+            }
+
+            void MarkRange(uint firstRegister, uint count)
+            {
+                for (uint offset = 0; offset < count; offset++)
+                {
+                    Mark(firstRegister + offset);
+                }
+            }
+
+            // Stage-initialized input VGPRs, matching EmitInitialState across every stage.
+            if (HasVertexOutputs)
+            {
+                if (_stage == Gen5SpirvStage.Vertex)
+                {
+                    Mark(_request.Program.VertexIndexRegister);
+                    foreach (var register in _request.Program.InstanceIndexRegisters)
+                    {
+                        Mark(register);
+                    }
+                }
+                else
+                {
+                    var registers = _request.Program.TessellationRegisters;
+                    Mark(registers.DomainCoordinateVector);
+                    Mark(registers.DomainCoordinateVector + 1);
+                    Mark(registers.DomainRelativePatchVector);
+                    Mark(registers.DomainPatchVector);
+                }
+            }
+            else if (_stage == Gen5SpirvStage.Pixel)
+            {
+                if (PixelVgprCaptureAddressMatches() ||
+                    !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_PIXEL_IMAGE_PC")))
+                {
+                    return null;
+                }
+
+                uint vgpr = 0;
+                ReadOnlySpan<uint> pixelInputDwords = [2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+                for (var bit = 0; bit < pixelInputDwords.Length; bit++)
+                {
+                    if ((_pixelInputAddress & (1u << bit)) == 0)
+                    {
+                        continue;
+                    }
+
+                    var dwords = pixelInputDwords[bit];
+                    MarkRange(vgpr, dwords);
+                    vgpr += dwords;
+                }
+            }
+            else if (_stage is Gen5SpirvStage.Compute or Gen5SpirvStage.Mesh)
+            {
+                // Local invocation ID components v0, v1, v2 (both halves in paired-lane mode).
+                MarkRange(0, 3);
+                if (_stage == Gen5SpirvStage.Mesh)
+                {
+                    Mark(5);
+                    Mark(8);
+                }
+
+                if (_request.TessellationHull is not null)
+                {
+                    var registers = _request.Program.TessellationRegisters;
+                    Mark(registers.HullPatchVector);
+                    Mark(registers.HullRelativeIdVector);
+                    Mark(registers.HullVertexVector);
+                    Mark(registers.HullLocalVector);
+                    foreach (var register in registers.HullInstanceVectors)
+                    {
+                        Mark(register);
+                    }
+                }
+            }
+            else
+            {
+                return null;
+            }
+
+            foreach (var instruction in _request.Program.Instructions)
+            {
+                var opcode = instruction.Opcode;
+                if (opcode is "VMovreldB32" or "VMovrelsdB32" or "VMovrelsd2B32")
+                {
+                    if (opcode != "VMovrelsd2B32" &&
+                        TryGetMoveRelativeOffsets(instruction.Pc, out var offsets) &&
+                        instruction.Destinations.Count > 0 &&
+                        instruction.Destinations[0].Kind == Gen5OperandKind.VectorRegister)
+                    {
+                        var baseDestination = instruction.Destinations[0].Value;
+                        foreach (var offset in offsets)
+                        {
+                            Mark((baseDestination + offset) & (VectorRegisterCount - 1));
+                        }
+                    }
+                    else
+                    {
+                        // An unbounded dynamic write can target any VGPR in the dynamic range.
+                        return null;
+                    }
+                }
+
+                var wideOpcode = opcode.Contains("64", StringComparison.Ordinal);
+                foreach (var destination in instruction.Destinations)
+                {
+                    if (destination.Kind != Gen5OperandKind.VectorRegister)
+                    {
+                        continue;
+                    }
+
+                    Mark(destination.Value);
+                    if (wideOpcode)
+                    {
+                        Mark(destination.Value + 1);
+                    }
+                }
+
+                switch (instruction.Control)
+                {
+                    case Gen5BufferMemoryControl buffer when !opcode.Contains("Store", StringComparison.Ordinal) &&
+                        (!opcode.Contains("Atomic", StringComparison.Ordinal) || buffer.Glc):
+                    {
+                        var count = Math.Max(buffer.DwordCount, 1u);
+                        if (wideOpcode || opcode.Contains("X2", StringComparison.Ordinal))
+                        {
+                            count = Math.Max(count, 2u);
+                        }
+
+                        MarkRange(buffer.VectorData, count);
+                        break;
+                    }
+                    case Gen5GlobalMemoryControl global when !opcode.Contains("Store", StringComparison.Ordinal) &&
+                        (!opcode.Contains("Atomic", StringComparison.Ordinal) || global.Glc):
+                    {
+                        var count = Math.Max(global.DwordCount, 1u);
+                        if (wideOpcode || opcode.Contains("X2", StringComparison.Ordinal))
+                        {
+                            count = Math.Max(count, 2u);
+                        }
+
+                        MarkRange(global.DestinationVectorRegister, count);
+                        break;
+                    }
+                    case Gen5ImageControl image when !opcode.StartsWith("ImageStore", StringComparison.Ordinal):
+                        // Covers up to 4 channels (including gather/resinfo/64-bit atomics) plus optional TFE.
+                        MarkRange(image.VectorData, 5u);
+                        break;
+                    case Gen5RayIntersectControl ray:
+                        MarkRange(ray.VectorData, Gen5RayIntersectControl.ResultDwords);
+                        break;
+                }
+            }
+
+            highestMarked = maxMarked;
+            return possiblyNonzero;
+        }
+
+        private ulong CountDynamicVectorReadCandidates(uint baseRegister)
+        {
+            var first = Math.Max(_dynamicVectorRange.First, baseRegister);
+            if (first > _dynamicVectorRange.Last)
+            {
+                return 0;
+            }
+
+            if (_possiblyNonzeroVectors is null)
+            {
+                return (ulong)(_dynamicVectorRange.Last - first + 1);
+            }
+
+            ulong count = 0;
+            for (var register = first; register <= _dynamicVectorRange.Last; register++)
+            {
+                if (_possiblyNonzeroVectors[register])
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+
         private bool ShouldUseDynamicVectorArray()
         {
             var rangeSize = (ulong)(_dynamicVectorRange.Last - _dynamicVectorRange.First + 1);
             var laneMultiplier = _pairedLanes || _pairedMeshLanes ? 2ul : 1ul;
-            ulong estimatedSelects = 0;
+            var hasUnboundedDynamicWrite = false;
+            ulong writeModeSelects = 0;
+            ulong readOnlySelects = 0;
+            ulong staticVgprOperandCount = 0;
+
             foreach (var instruction in _request.Program.Instructions)
             {
-                if (instruction.Opcode is not ("VMovrelsB32" or "VMovreldB32" or "VMovrelsdB32" or "VMovrelsd2B32"))
+                var opcode = instruction.Opcode;
+                if (opcode is "VMovrelsB32" or "VMovreldB32" or "VMovrelsdB32" or "VMovrelsd2B32")
                 {
+                    if (opcode != "VMovrelsd2B32" && TryGetMoveRelativeOffsets(instruction.Pc, out _))
+                    {
+                        continue;
+                    }
+
+                    var ops = opcode is "VMovrelsdB32" or "VMovrelsd2B32" ? 2ul : 1ul;
+                    writeModeSelects += ops * laneMultiplier * rangeSize;
+
+                    if (opcode != "VMovrelsB32")
+                    {
+                        hasUnboundedDynamicWrite = true;
+                        continue;
+                    }
+
+                    if (!hasUnboundedDynamicWrite)
+                    {
+                        var baseRegister = instruction.Sources.Count > 0 &&
+                            instruction.Sources[0].Kind == Gen5OperandKind.VectorRegister
+                            ? instruction.Sources[0].Value
+                            : _dynamicVectorRange.First;
+                        readOnlySelects += laneMultiplier * CountDynamicVectorReadCandidates(baseRegister);
+                    }
+
                     continue;
                 }
 
-                if (instruction.Opcode != "VMovrelsd2B32" && TryGetMoveRelativeOffsets(instruction.Pc, out _))
+                foreach (var operand in instruction.Sources)
                 {
-                    continue;
+                    if (operand.Kind == Gen5OperandKind.VectorRegister)
+                    {
+                        staticVgprOperandCount++;
+                    }
                 }
 
-                var ops = instruction.Opcode is "VMovrelsdB32" or "VMovrelsd2B32" ? 2ul : 1ul;
-                estimatedSelects += ops * laneMultiplier * rangeSize;
-                if (estimatedSelects > DynamicVectorSelectBudget)
+                foreach (var operand in instruction.Destinations)
                 {
-                    return true;
+                    if (operand.Kind == Gen5OperandKind.VectorRegister)
+                    {
+                        staticVgprOperandCount++;
+                    }
                 }
             }
 
-            return false;
+            if (hasUnboundedDynamicWrite)
+            {
+                return writeModeSelects > DynamicVectorSelectBudget;
+            }
+
+            if (readOnlySelects == 0)
+            {
+                return false;
+            }
+
+            var effectiveBudget = Math.Max(
+                (ulong)DynamicVectorSelectBudget,
+                Math.Min(ReadOnlyDynamicVectorSelectBudgetCap, staticVgprOperandCount));
+            return readOnlySelects > effectiveBudget;
         }
 
         // The V_MOVREL* opcodes address the VGPR file with a register number that
@@ -9780,7 +10032,7 @@ public static partial class Gen5SpirvTranslator
             return (Math.Min(first, last), last);
         }
 
-        private uint LoadVDynamic(uint registerIndex)
+        private uint LoadVDynamic(uint registerIndex, uint minRegister = 0)
         {
             if (_vectorRegisters != 0)
             {
@@ -9808,9 +10060,15 @@ public static partial class Gen5SpirvTranslator
                     UInt(0));
             }
 
+            var first = Math.Max(_dynamicVectorRange.First, minRegister);
             var result = UInt(0);
-            for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
+            for (var register = first; register <= _dynamicVectorRange.Last; register++)
             {
+                if (_possiblyNonzeroVectors is not null && !_possiblyNonzeroVectors[register])
+                {
+                    continue;
+                }
+
                 result = _module.AddInstruction(
                     SpirvOp.Select,
                     _uintType,
