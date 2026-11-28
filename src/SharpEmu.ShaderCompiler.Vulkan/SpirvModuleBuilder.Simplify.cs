@@ -1,6 +1,8 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Runtime.InteropServices;
+
 namespace SharpEmu.ShaderCompiler.Vulkan;
 
 public sealed partial class SpirvModuleBuilder
@@ -9,8 +11,8 @@ public sealed partial class SpirvModuleBuilder
     private const uint GlslModf = 35;
     private const uint GlslFrexp = 51;
     private const uint SubgroupScope = 3;
-    private static readonly uint[] GlslMinMax = [37, 38, 39, 40, 41, 42, 79, 80];
     private const uint GlslUMin = 38;
+    private static readonly Dictionary<uint, uint> EmptyValues = [];
 
     private readonly Dictionary<uint, uint> _resultTypes = [];
     private readonly Dictionary<uint, (uint Width, bool Signed)> _integerTypeInfo = [];
@@ -31,6 +33,8 @@ public sealed partial class SpirvModuleBuilder
     private readonly HashSet<uint> _localVariables = [];
     private readonly HashSet<uint> _escapedVariables = [];
     private readonly Dictionary<uint, uint> _elementBases = [];
+    private readonly Dictionary<uint, List<uint>> _elementsByBase = [];
+    private readonly HashSet<uint> _branchTargets = [];
     private readonly HashSet<uint> _scalarPointerTypes = [];
     private readonly HashSet<uint> _inputVariables = [];
     // Variables nothing writes while the invocation runs: descriptors (UniformConstant) and push constants.
@@ -82,8 +86,21 @@ public sealed partial class SpirvModuleBuilder
 
         public Dictionary<InstructionKey, uint> Own => _own;
 
-        public bool TryGetValue(InstructionKey key, out uint value) =>
-            _own.TryGetValue(key, out value) || (_base is not null && _base.TryGetValue(key, out value));
+        public bool TryGetValue(InstructionKey key, out uint value)
+        {
+            if (_own.Count > 0 && _own.TryGetValue(key, out value))
+            {
+                return true;
+            }
+
+            if (_base is not null)
+            {
+                return _base.TryGetValue(key, out value);
+            }
+
+            value = 0;
+            return false;
+        }
 
         public void Set(InstructionKey key, uint value) => _own[key] = value;
 
@@ -95,18 +112,28 @@ public sealed partial class SpirvModuleBuilder
 
         public ExpressionTable Copy()
         {
+            if (_own.Count == 0)
+            {
+                return new ExpressionTable { _base = _base };
+            }
+
             if (_own.Count < MaxOwnEntries)
             {
                 return new ExpressionTable { _base = _base, _own = new Dictionary<InstructionKey, uint>(_own) };
             }
 
+            // Copy is only invoked on shared (immutable) tables, so _own can be promoted directly as the new base.
             if (_base is null)
             {
-                return new ExpressionTable { _base = new Dictionary<InstructionKey, uint>(_own) };
+                return new ExpressionTable { _base = _own };
             }
 
-            var merged = new Dictionary<InstructionKey, uint>(_base);
-            merged.EnsureCapacity(_base.Count + _own.Count);
+            var merged = new Dictionary<InstructionKey, uint>(_base.Count + _own.Count);
+            foreach (var (key, value) in _base)
+            {
+                merged.Add(key, value);
+            }
+
             foreach (var (key, value) in _own)
             {
                 merged.Add(key, value);
@@ -125,15 +152,22 @@ public sealed partial class SpirvModuleBuilder
             Opcode = opcode;
             Type = type;
             Operands = operands;
-            var hash = new HashCode();
-            hash.Add(opcode);
-            hash.Add(type);
-            foreach (var operand in operands)
+            _hash = operands.Length switch
             {
-                hash.Add(operand);
-            }
+                1 => HashCode.Combine(opcode, type, operands[0]),
+                2 => HashCode.Combine(opcode, type, operands[0], operands[1]),
+                3 => HashCode.Combine(opcode, type, operands[0], operands[1], operands[2]),
+                4 => HashCode.Combine(opcode, type, operands[0], operands[1], operands[2], operands[3]),
+                _ => ComputeHash(opcode, type, operands),
+            };
+        }
 
-            _hash = hash.ToHashCode();
+        private InstructionKey(SpirvOp opcode, uint type, uint[] operands, int hash)
+        {
+            Opcode = opcode;
+            Type = type;
+            Operands = operands;
+            _hash = hash;
         }
 
         public SpirvOp Opcode { get; }
@@ -142,6 +176,8 @@ public sealed partial class SpirvModuleBuilder
 
         public uint[] Operands { get; }
 
+        public InstructionKey WithClonedOperands() => new(Opcode, Type, Operands.ToArray(), _hash);
+
         public bool Equals(InstructionKey other) =>
             _hash == other._hash && Opcode == other.Opcode && Type == other.Type &&
             Operands.AsSpan().SequenceEqual(other.Operands);
@@ -149,6 +185,19 @@ public sealed partial class SpirvModuleBuilder
         public override bool Equals(object? obj) => obj is InstructionKey other && Equals(other);
 
         public override int GetHashCode() => _hash;
+
+        private static int ComputeHash(SpirvOp opcode, uint type, uint[] operands)
+        {
+            var hash = new HashCode();
+            hash.Add(opcode);
+            hash.Add(type);
+            foreach (var operand in operands)
+            {
+                hash.Add(operand);
+            }
+
+            return hash.ToHashCode();
+        }
     }
 
     public static bool KeepsUnreadVariables { get; set; }
@@ -208,7 +257,7 @@ public sealed partial class SpirvModuleBuilder
         }
 
         var result = EmitResult(_functions, opcode, resultType, operands);
-        var key = new InstructionKey(opcode, resultType, operands.ToArray());
+        var key = lookup.WithClonedOperands();
         WritableBlockValues().Set(key, result);
         _definitions[result] = new Definition(opcode, resultType, key.Operands);
         return result;
@@ -316,12 +365,23 @@ public sealed partial class SpirvModuleBuilder
         if (!_blockValues.TryGetValue(lookup, out element))
         {
             element = EmitResult(_functions, SpirvOp.AccessChain, resultType, operands);
-            var key = new InstructionKey(SpirvOp.AccessChain, resultType, operands.ToArray());
+            var key = lookup.WithClonedOperands();
             WritableBlockValues().Set(key, element);
             _definitions[element] = new Definition(SpirvOp.AccessChain, resultType, key.Operands);
         }
 
-        _elementBases[element] = operands[0];
+        var baseVariable = operands[0];
+        if (_elementBases.TryAdd(element, baseVariable))
+        {
+            ref var elements = ref CollectionsMarshal.GetValueRefOrAddDefault(_elementsByBase, baseVariable, out var exists);
+            if (!exists)
+            {
+                elements = [];
+            }
+
+            elements!.Add(element);
+        }
+
         return true;
     }
 
@@ -344,7 +404,7 @@ public sealed partial class SpirvModuleBuilder
             }
 
             var value = EmitResult(_functions, SpirvOp.Load, resultType, operands);
-            WritableBlockValues().Set(new InstructionKey(SpirvOp.Load, resultType, operands.ToArray()), value);
+            WritableBlockValues().Set(lookup.WithClonedOperands(), value);
             return value;
         }
 
@@ -371,7 +431,7 @@ public sealed partial class SpirvModuleBuilder
         var result = EmitResult(_functions, SpirvOp.Load, resultType, operands);
         _inheritedPointers.Remove(pointer);
         _pendingStores.Remove(pointer);
-        if (_elementBases.TryGetValue(pointer, out var elementBase))
+        if (_elementBases.Count > 0 && _elementBases.TryGetValue(pointer, out var elementBase))
         {
             _pendingStores.Remove(elementBase);
         }
@@ -405,7 +465,7 @@ public sealed partial class SpirvModuleBuilder
             return;
         }
 
-        if (_elementBases.TryGetValue(pointer, out var elementBase))
+        if (_elementBases.Count > 0 && _elementBases.TryGetValue(pointer, out var elementBase))
         {
             _variableValues.Remove(elementBase);
             _pendingStores.Remove(elementBase);
@@ -454,9 +514,17 @@ public sealed partial class SpirvModuleBuilder
     // Zero when the entry block is not open or an index is not a constant.
     public uint EntryWordLoad(uint resultType, uint pointerType, uint variable, params uint[] constantIndices)
     {
-        if (!IsEntryAvailable() || constantIndices.Any(index => !_scalarConstantValues.ContainsKey(index)))
+        if (!IsEntryAvailable())
         {
             return 0;
+        }
+
+        foreach (var index in constantIndices)
+        {
+            if (!_scalarConstantValues.ContainsKey(index))
+            {
+                return 0;
+            }
         }
 
         uint[] chain = [variable, .. constantIndices];
@@ -474,12 +542,14 @@ public sealed partial class SpirvModuleBuilder
     private bool IsEntryAvailable() => CurrentFunction != 0 && !_entryLabelPending && _entryLabelOffset >= 0;
 
     private bool IsImmutablePointer(uint pointer) =>
-        _immutableVariables.Contains(pointer) ||
-        (Defines(pointer, SpirvOp.AccessChain, out var chain) && _immutableVariables.Contains(chain.Operands[0]));
+        _immutableVariables.Count > 0 &&
+        (_immutableVariables.Contains(pointer) ||
+            (Defines(pointer, SpirvOp.AccessChain, out var chain) && _immutableVariables.Contains(chain.Operands[0])));
 
     private bool CanHoistToEntry(SpirvOp opcode, uint[] operands)
     {
-        if (!IsEntryAvailable() || opcode is SpirvOp.ExtInst or SpirvOp.CompositeExtract or SpirvOp.CompositeInsert or
+        if (!IsEntryAvailable() || _entryIds.Count == 0 ||
+            opcode is SpirvOp.ExtInst or SpirvOp.CompositeExtract or SpirvOp.CompositeInsert or
                 SpirvOp.VectorShuffle or SpirvOp.AccessChain or SpirvOp.PtrAccessChain or SpirvOp.ArrayLength or
                 SpirvOp.ConvertUToPtr or SpirvOp.UDiv or SpirvOp.SDiv or SpirvOp.UMod or SpirvOp.SRem or SpirvOp.SMod ||
             IsSubgroupOperation(opcode))
@@ -506,15 +576,16 @@ public sealed partial class SpirvModuleBuilder
 
     private uint EntryOperation(SpirvOp opcode, uint resultType, uint[] operands)
     {
-        if (_entryOperations.TryGetValue(new InstructionKey(opcode, resultType, operands), out var known))
+        var lookup = new InstructionKey(opcode, resultType, operands);
+        if (_entryOperations.TryGetValue(lookup, out var known))
         {
             return known;
         }
 
-        var stored = operands.ToArray();
-        var result = AppendToEntry(opcode, resultType, stored);
-        _entryOperations[new InstructionKey(opcode, resultType, stored)] = result;
-        _definitions[result] = new Definition(opcode, resultType, stored);
+        var key = lookup.WithClonedOperands();
+        var result = AppendToEntry(opcode, resultType, key.Operands);
+        _entryOperations[key] = result;
+        _definitions[result] = new Definition(opcode, resultType, key.Operands);
         return result;
     }
 
@@ -540,10 +611,17 @@ public sealed partial class SpirvModuleBuilder
         _localVariables.Contains(pointer) && !_escapedVariables.Contains(pointer);
 
     private bool IsTrackedPointer(uint pointer) =>
-        IsTrackedVariable(pointer) || (_elementBases.TryGetValue(pointer, out var variable) && IsTrackedVariable(variable));
+        IsTrackedVariable(pointer) ||
+        (_elementBases.Count > 0 && _elementBases.TryGetValue(pointer, out var variable) && IsTrackedVariable(variable));
 
     private void NoteVariableUses(uint[] operands, int literalIndex = -1)
     {
+        if (_localVariables.Count == 0)
+        {
+            return;
+        }
+
+        var hasElements = _elementBases.Count > 0;
         for (var index = 0; index < operands.Length; index++)
         {
             if (index == literalIndex) continue;
@@ -552,7 +630,7 @@ public sealed partial class SpirvModuleBuilder
             {
                 EscapeVariable(operand);
             }
-            else if (_elementBases.TryGetValue(operand, out var variable))
+            else if (hasElements && _elementBases.TryGetValue(operand, out var variable))
             {
                 EscapeVariable(variable);
             }
@@ -571,19 +649,52 @@ public sealed partial class SpirvModuleBuilder
 
     private void ForgetElements(uint variable, bool keepValues)
     {
-        foreach (var (element, _) in _pendingStores)
+        if (_elementsByBase.Count == 0 || !_elementsByBase.TryGetValue(variable, out var elements))
         {
-            if (_elementBases.TryGetValue(element, out var owner) && owner == variable)
+            return;
+        }
+
+        if (_pendingStores.Count > 0)
+        {
+            foreach (var element in elements)
             {
                 _pendingStores.Remove(element);
             }
         }
 
-        if (keepValues)
+        if (keepValues || _variableValues.Count == 0)
         {
             return;
         }
 
+        uint singleMatch = 0;
+        var matchCount = 0;
+        foreach (var element in elements)
+        {
+            if (_variableValues.ContainsKey(element))
+            {
+                singleMatch = element;
+                matchCount++;
+                if (matchCount > 1)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (matchCount == 0)
+        {
+            return;
+        }
+
+        if (matchCount == 1)
+        {
+            _variableValues.Remove(singleMatch);
+            return;
+        }
+
+        // Preserve _variableValues removal order when multiple elements are evicted so Dictionary free-list order
+        // (and subsequent OpPhi emission order at merge blocks) remains bit-identical.
         foreach (var (element, _) in _variableValues)
         {
             if (_elementBases.TryGetValue(element, out var owner) && owner == variable)
@@ -595,45 +706,65 @@ public sealed partial class SpirvModuleBuilder
 
     private void NoteBranchTargets(SpirvOp opcode, uint[] operands)
     {
-        var targets = new HashSet<uint>();
+        BlockState? state = null;
         switch (opcode)
         {
             case SpirvOp.Branch:
-                targets.Add(operands[0]);
+                RecordBranchTarget(operands[0], ref state);
                 break;
             case SpirvOp.BranchConditional:
-                targets.Add(operands[1]);
-                targets.Add(operands[2]);
-                break;
-            default:
-                targets.Add(operands[1]);
-                for (var index = 3; index < operands.Length; index += 2)
+            {
+                var trueTarget = operands[1];
+                var falseTarget = operands[2];
+                RecordBranchTarget(trueTarget, ref state);
+                if (falseTarget != trueTarget)
                 {
-                    targets.Add(operands[index]);
+                    RecordBranchTarget(falseTarget, ref state);
                 }
 
                 break;
-        }
+            }
+            default:
+            {
+                _branchTargets.Clear();
+                if (_branchTargets.Add(operands[1]))
+                {
+                    RecordBranchTarget(operands[1], ref state);
+                }
 
-        BlockState? state = null;
-        foreach (var target in targets)
+                for (var index = 3; index < operands.Length; index += 2)
+                {
+                    var target = operands[index];
+                    if (_branchTargets.Add(target))
+                    {
+                        RecordBranchTarget(target, ref state);
+                    }
+                }
+
+                break;
+            }
+        }
+    }
+
+    private void RecordBranchTarget(uint target, ref BlockState? state)
+    {
+        ref var count = ref CollectionsMarshal.GetValueRefOrAddDefault(_predecessorCounts, target, out _);
+        count++;
+        if (!InheritBlockState || _emittedLabels.Contains(target))
         {
-            _predecessorCounts[target] = _predecessorCounts.GetValueOrDefault(target) + 1;
-            if (!InheritBlockState || _emittedLabels.Contains(target))
-            {
-                continue;
-            }
-
-            state ??= new BlockState(new Dictionary<uint, uint>(_variableValues), ShareBlockValues(), _blockValuesSerial,
-                _blockValuesBases);
-            if (!_incomingStates.TryGetValue(target, out var incoming))
-            {
-                incoming = [];
-                _incomingStates.Add(target, incoming);
-            }
-
-            incoming.Add((_currentBlock, state));
+            return;
         }
+
+        state ??= new BlockState(
+            _variableValues.Count == 0 ? EmptyValues : new Dictionary<uint, uint>(_variableValues),
+            ShareBlockValues(), _blockValuesSerial, _blockValuesBases);
+        ref var incoming = ref CollectionsMarshal.GetValueRefOrAddDefault(_incomingStates, target, out var exists);
+        if (!exists)
+        {
+            incoming = [];
+        }
+
+        incoming!.Add((_currentBlock, state));
     }
 
     private void EnterBlock(uint label)
@@ -669,13 +800,27 @@ public sealed partial class SpirvModuleBuilder
 
         if (!_loopHeaders.Contains(label))
         {
-            foreach (var (pointer, value) in first.Values)
+            if (incoming.Count == 1)
             {
-                var merged = MergeIncomingValue(pointer, value, incoming);
-                if (merged != 0)
+                foreach (var (pointer, value) in first.Values)
                 {
-                    _variableValues[pointer] = merged;
-                    _inheritedPointers.Add(pointer);
+                    if (value != 0)
+                    {
+                        _variableValues[pointer] = value;
+                        _inheritedPointers.Add(pointer);
+                    }
+                }
+            }
+            else
+            {
+                foreach (var (pointer, value) in first.Values)
+                {
+                    var merged = MergeIncomingValue(pointer, value, incoming);
+                    if (merged != 0)
+                    {
+                        _variableValues[pointer] = merged;
+                        _inheritedPointers.Add(pointer);
+                    }
                 }
             }
         }
@@ -745,14 +890,22 @@ public sealed partial class SpirvModuleBuilder
     {
         var type = TypeOf(value);
         var same = true;
-        foreach (var (_, state) in incoming)
+        for (var index = 1; index < incoming.Count; index++)
         {
-            if (!state.Values.TryGetValue(pointer, out var other) || TypeOf(other) != type)
+            if (!incoming[index].State.Values.TryGetValue(pointer, out var other))
             {
                 return 0;
             }
 
-            same &= other == value;
+            if (other != value)
+            {
+                if (TypeOf(other) != type)
+                {
+                    return 0;
+                }
+
+                same = false;
+            }
         }
 
         if (same)
@@ -994,7 +1147,7 @@ public sealed partial class SpirvModuleBuilder
                 HasType(operands[0], resultType):
                 result = operands[0];
                 return true;
-            case SpirvOp.ExtInst when operands.Length == 4 && GlslMinMax.Contains(operands[1]) &&
+            case SpirvOp.ExtInst when operands.Length == 4 && operands[1] is (>= 37 and <= 42) or 79 or 80 &&
                 operands[2] == operands[3] && HasType(operands[2], resultType):
                 result = operands[2];
                 return true;
@@ -1091,19 +1244,23 @@ public sealed partial class SpirvModuleBuilder
                 {
                     result = Keep(operands[0]);
                 }
-                else if (rightConstant && Defines(operands[0], SpirvOp.BitwiseAnd, out var maskedAnd) &&
-                    IsIntegerConstant(maskedAnd.Operands[1], out var innerMask))
+                else
                 {
-                    result = AddInstruction(SpirvOp.BitwiseAnd, resultType, maskedAnd.Operands[0],
-                        IntegerConstant(resultType, innerMask & right));
-                }
-                else if (Defines(operands[0], SpirvOp.BitwiseAnd, out var leftAnd) && leftAnd.Operands.Contains(operands[1]))
-                {
-                    result = Keep(operands[0]);
-                }
-                else if (Defines(operands[1], SpirvOp.BitwiseAnd, out var rightAnd) && rightAnd.Operands.Contains(operands[0]))
-                {
-                    result = Keep(operands[1]);
+                    var isLeftAnd = Defines(operands[0], SpirvOp.BitwiseAnd, out var leftAnd);
+                    if (isLeftAnd && rightConstant && IsIntegerConstant(leftAnd.Operands[1], out var innerMask))
+                    {
+                        result = AddInstruction(SpirvOp.BitwiseAnd, resultType, leftAnd.Operands[0],
+                            IntegerConstant(resultType, innerMask & right));
+                    }
+                    else if (isLeftAnd && (leftAnd.Operands[0] == operands[1] || leftAnd.Operands[1] == operands[1]))
+                    {
+                        result = Keep(operands[0]);
+                    }
+                    else if (Defines(operands[1], SpirvOp.BitwiseAnd, out var rightAnd) &&
+                        (rightAnd.Operands[0] == operands[0] || rightAnd.Operands[1] == operands[0]))
+                    {
+                        result = Keep(operands[1]);
+                    }
                 }
 
                 break;
@@ -1175,25 +1332,24 @@ public sealed partial class SpirvModuleBuilder
         return false;
     }
 
-    private bool TryOwnLaneBallotTest(uint left, uint right, out uint condition)
-    {
-        condition = 0;
-        foreach (var (ballotWord, laneBit) in new[] { (left, right), (right, left) })
-        {
-            if (!Defines(ballotWord, SpirvOp.CompositeExtract, out var extract) || extract.Operands is not [var vote, 0] ||
-                !Defines(vote, SpirvOp.GroupNonUniformBallot, out var ballot) ||
-                !IsIntegerConstant(ballot.Operands[0], out var scope) || scope != SubgroupScope ||
-                !TryOwnLaneBit(laneBit, out var guard))
-            {
-                continue;
-            }
+    private bool TryOwnLaneBallotTest(uint left, uint right, out uint condition) =>
+        TryOwnLaneBallotTestOrdered(left, right, out condition) ||
+        TryOwnLaneBallotTestOrdered(right, left, out condition);
 
-            var voted = ballot.Operands[1];
-            condition = guard == 0 ? voted : AddInstruction(SpirvOp.LogicalAnd, TypeOf(voted), guard, voted);
-            return true;
+    private bool TryOwnLaneBallotTestOrdered(uint ballotWord, uint laneBit, out uint condition)
+    {
+        if (!Defines(ballotWord, SpirvOp.CompositeExtract, out var extract) || extract.Operands is not [var vote, 0] ||
+            !Defines(vote, SpirvOp.GroupNonUniformBallot, out var ballot) ||
+            !IsIntegerConstant(ballot.Operands[0], out var scope) || scope != SubgroupScope ||
+            !TryOwnLaneBit(laneBit, out var guard))
+        {
+            condition = 0;
+            return false;
         }
 
-        return false;
+        var voted = ballot.Operands[1];
+        condition = guard == 0 ? voted : AddInstruction(SpirvOp.LogicalAnd, TypeOf(voted), guard, voted);
+        return true;
     }
 
     private bool TryOwnLaneBit(uint value, out uint guard)
@@ -1419,13 +1575,31 @@ public sealed partial class SpirvModuleBuilder
                 MaxIntegerValue(definition.Operands[1]) < 32:
                 high = Constant(wordType, 0);
                 return true;
-            case SpirvOp.BitwiseAnd when (TrySplitHighWord(definition.Operands[0], wordType, depth + 1, out var maskHigh) &&
-                    IsIntegerConstant(maskHigh, out var maskValue) && maskValue == 0) ||
-                (TrySplitHighWord(definition.Operands[1], wordType, depth + 1, out maskHigh) &&
-                    IsIntegerConstant(maskHigh, out maskValue) && maskValue == 0):
-                high = Constant(wordType, 0);
-                return true;
-            case SpirvOp.BitwiseOr or SpirvOp.BitwiseAnd or SpirvOp.BitwiseXor
+            case SpirvOp.BitwiseAnd:
+            {
+                var hasLeft = TrySplitHighWord(definition.Operands[0], wordType, depth + 1, out var left);
+                if (hasLeft && IsIntegerConstant(left, out var leftMask) && leftMask == 0)
+                {
+                    high = Constant(wordType, 0);
+                    return true;
+                }
+
+                var hasRight = TrySplitHighWord(definition.Operands[1], wordType, depth + 1, out var right);
+                if (hasRight && IsIntegerConstant(right, out var rightMask) && rightMask == 0)
+                {
+                    high = Constant(wordType, 0);
+                    return true;
+                }
+
+                if (hasLeft && hasRight)
+                {
+                    high = AddInstruction(SpirvOp.BitwiseAnd, wordType, left, right);
+                    return true;
+                }
+
+                return false;
+            }
+            case SpirvOp.BitwiseOr or SpirvOp.BitwiseXor
                 when TrySplitHighWord(definition.Operands[0], wordType, depth + 1, out var left) &&
                     TrySplitHighWord(definition.Operands[1], wordType, depth + 1, out var right):
                 high = AddInstruction(definition.Opcode, wordType, left, right);
